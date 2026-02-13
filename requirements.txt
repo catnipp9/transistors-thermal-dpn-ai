@@ -1,0 +1,31 @@
+# Core ML/Data Science
+numpy>=2.0.0
+pandas>=2.0.0
+scikit-learn>=1.4.0
+scipy>=1.12.0
+
+# Image Processing
+Pillow>=10.0.0
+scikit-image>=0.22.0
+opencv-python>=4.9.0
+
+# Deep Learning (PyTorch)
+torch>=2.2.0
+torchvision>=0.17.0
+
+# Visualization
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# API
+fastapi>=0.110.0
+uvicorn>=0.27.0
+
+# Jupyter
+jupyter>=1.0.0
+ipykernel>=6.29.0
+
+# Utilities
+tqdm>=4.66.0
+openpyxl>=3.1.0
+pyyaml>=6.0.0
