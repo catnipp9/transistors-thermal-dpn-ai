@@ -1,0 +1,8 @@
+path: C:\Users\Jamel\Documents\GitHub\transistors-thermal-ai-testing\checkpoints\yolo_dataset
+train: train
+val: val
+test: test
+nc: 2
+names:
+- Control
+- Diabetic

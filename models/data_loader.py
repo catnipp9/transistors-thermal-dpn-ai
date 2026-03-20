@@ -349,6 +349,145 @@ def load_data_for_sklearn(
     return X_train, X_test, y_train, y_test
 
 
+def prepare_yolo_dataset(
+    data_dir: str,
+    output_dir: str,
+    test_size: float = 0.15,
+    val_size: float = 0.15,
+    random_state: int = 42,
+) -> str:
+    """
+    Build a YOLO classification dataset from the existing thermogram PNG files
+    and write a dataset YAML file that Ultralytics expects.
+
+    Directory layout created::
+
+        <output_dir>/
+          train/
+            Control/   ← PNG images for class 0
+            Diabetic/  ← PNG images for class 1
+          val/
+            Control/
+            Diabetic/
+          test/
+            Control/
+            Diabetic/
+          dataset.yaml
+
+    Args:
+        data_dir: Root data directory containing "Control Group" and "DM Group".
+        output_dir: Where to write the YOLO-formatted dataset.
+        test_size: Fraction of images to use for test split.
+        val_size: Fraction of images to use for validation split.
+        random_state: Random seed for reproducible splits.
+
+    Returns:
+        Absolute path to the generated ``dataset.yaml`` file.
+    """
+    import shutil
+    import yaml
+
+    data_path = Path(data_dir)
+    out_path = Path(output_dir)
+
+    # Collect all (image_path, class_name) pairs
+    samples: List[Tuple[Path, str]] = []
+
+    group_map = {
+        "Control Group": "Control",
+        "DM Group": "Diabetic",
+    }
+
+    for group_name, class_name in group_map.items():
+        group_dir = data_path / group_name
+        if not group_dir.exists():
+            continue
+        for subject_folder in sorted(group_dir.iterdir()):
+            if not subject_folder.is_dir():
+                continue
+            for png_file in subject_folder.glob("*.png"):
+                samples.append((png_file, class_name))
+
+    if not samples:
+        raise ValueError(f"No PNG images found under {data_dir}")
+
+    # Stratified train / val / test split
+    paths = [s[0] for s in samples]
+    labels_str = [s[1] for s in samples]
+
+    # First cut off test set
+    train_val_paths, test_paths, train_val_labels, test_labels = train_test_split(
+        paths, labels_str,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=labels_str,
+    )
+
+    # Then cut off val set from the remaining
+    val_fraction = val_size / (1.0 - test_size)
+    train_paths, val_paths, train_labels, val_labels = train_test_split(
+        train_val_paths, train_val_labels,
+        test_size=val_fraction,
+        random_state=random_state,
+        stratify=train_val_labels,
+    )
+
+    splits = {
+        "train": list(zip(train_paths, train_labels)),
+        "val":   list(zip(val_paths,   val_labels)),
+        "test":  list(zip(test_paths,  test_labels)),
+    }
+
+    print("\nYOLO dataset split:")
+    for split_name, split_samples in splits.items():
+        ctrl = sum(1 for _, c in split_samples if c == "Control")
+        diab = sum(1 for _, c in split_samples if c == "Diabetic")
+        print(f"  {split_name:5s}: {len(split_samples)} images  (Control={ctrl}, Diabetic={diab})")
+
+    # Copy images into YOLO class sub-folders
+    for split_name, split_samples in splits.items():
+        for src_path, class_name in split_samples:
+            dest_dir = out_path / split_name / class_name
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dest_dir / src_path.name)
+
+    # Oversample minority class in train split only to address class imbalance.
+    # Control (45 subjects) is heavily underrepresented vs Diabetic (122 subjects).
+    # Val and test splits are left untouched — never augment evaluation data.
+    train_dir = out_path / "train"
+    class_counts = {
+        cls: len(list((train_dir / cls).glob("*.png")))
+        for cls in ["Control", "Diabetic"]
+    }
+    majority_count = max(class_counts.values())
+    print(f"\nClass counts before oversampling: {class_counts}")
+    for cls, count in class_counts.items():
+        if count < majority_count:
+            existing = sorted((train_dir / cls).glob("*.png"))
+            copies_needed = majority_count - count
+            cycle = (existing * ((copies_needed // len(existing)) + 1))[:copies_needed]
+            for i, src in enumerate(cycle):
+                shutil.copy2(src, train_dir / cls / f"{src.stem}_os{i}{src.suffix}")
+            print(f"  Oversampled '{cls}': {count} -> {majority_count} images (+{copies_needed} copies)")
+
+    # Write dataset YAML
+    yaml_content = {
+        "path": str(out_path.resolve()),
+        "train": "train",
+        "val":   "val",
+        "test":  "test",
+        "nc": 2,
+        "names": ["Control", "Diabetic"],
+    }
+    yaml_path = out_path / "dataset.yaml"
+    with open(yaml_path, "w") as f:
+        yaml.dump(yaml_content, f, default_flow_style=False, sort_keys=False)
+
+    print(f"\nYOLO dataset written to: {out_path}")
+    print(f"Dataset YAML: {yaml_path}")
+    return str(yaml_path.resolve())
+
+
 if __name__ == "__main__":
     # Test the data loader
     data_dir = "../data"

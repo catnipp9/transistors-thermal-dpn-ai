@@ -87,7 +87,8 @@ class PredictionResponse(BaseModel):
 class HealthResponse(BaseModel):
     """Response model for health check."""
     status: str
-    cnn_model_loaded: bool
+    image_model_loaded: bool
+    image_model_type: str
     sklearn_model_loaded: bool
 
 
@@ -184,34 +185,63 @@ class PatientPredictionResponse(BaseModel):
 
 # ==================== Global State ====================
 
-cnn_classifier: Optional[DPNClassifier] = None
+# image_classifier holds whichever image model is available: YOLOv11 (preferred) or CNN (fallback)
+image_classifier: Optional[DPNClassifier] = None
 sklearn_classifier: Optional[DPNClassifier] = None
+
+# Keep a reference to the legacy name so predict_patient() calls still work
+cnn_classifier: Optional[DPNClassifier] = None
 
 
 # ==================== Startup Event ====================
 
 @app.on_event("startup")
 async def load_models():
-    """Load both CNN and sklearn models on startup."""
-    global cnn_classifier, sklearn_classifier
+    """Load image model (YOLOv11 preferred, CNN fallback) and sklearn model on startup."""
+    global image_classifier, sklearn_classifier, cnn_classifier
 
     checkpoints_dir = Path(__file__).parent.parent / "checkpoints"
 
-    # Load CNN model (for thermal images)
+    # --- Image model: try YOLOv11 first, then CNN ---
+    yolo_paths = [
+        checkpoints_dir / "best_yolo_model.pt",
+        checkpoints_dir / "yolo11_dpn" / "weights" / "best.pt",
+    ]
     cnn_path = checkpoints_dir / "best_model.pth"
-    if cnn_path.exists():
+
+    loaded_image_model = False
+    for yolo_path in yolo_paths:
+        if yolo_path.exists():
+            try:
+                image_classifier = DPNClassifier(
+                    model_path=str(yolo_path),
+                    model_type="yolo"
+                )
+                cnn_classifier = image_classifier  # alias for predict_patient()
+                print(f"YOLOv11 model loaded from {yolo_path}")
+                loaded_image_model = True
+                break
+            except Exception as e:
+                print(f"Error loading YOLOv11 model from {yolo_path}: {e}")
+
+    if not loaded_image_model and cnn_path.exists():
         try:
-            cnn_classifier = DPNClassifier(
+            image_classifier = DPNClassifier(
                 model_path=str(cnn_path),
                 model_type="cnn"
             )
-            print(f"CNN model loaded from {cnn_path}")
+            cnn_classifier = image_classifier  # alias for predict_patient()
+            print(f"CNN model loaded from {cnn_path} (YOLOv11 not found, using fallback)")
+            loaded_image_model = True
         except Exception as e:
             print(f"Error loading CNN model: {e}")
-    else:
-        print(f"Warning: CNN model not found at {cnn_path}")
 
-    # Load sklearn model (for temperature values)
+    if not loaded_image_model:
+        print("Warning: No image model found. Run training first.")
+        print(f"  Expected YOLO: {yolo_paths[0]}")
+        print(f"  Expected CNN:  {cnn_path}")
+
+    # --- sklearn model (for temperature CSV/JSON endpoints) ---
     sklearn_path = checkpoints_dir / "best_sklearn_model.joblib"
     if sklearn_path.exists():
         try:
@@ -225,8 +255,8 @@ async def load_models():
     else:
         print(f"Warning: sklearn model not found at {sklearn_path}")
 
-    if cnn_classifier is None and sklearn_classifier is None:
-        print("WARNING: No models loaded! Run training notebook first.")
+    if image_classifier is None and sklearn_classifier is None:
+        print("WARNING: No models loaded! Run the training notebook first.")
 
 
 # ==================== Endpoints ====================
@@ -245,9 +275,11 @@ async def root():
 @app.get("/health", response_model=HealthResponse, tags=["General"])
 async def health_check():
     """Check API health and model status."""
+    model_type = image_classifier.model_type.upper() if image_classifier else "none"
     return HealthResponse(
         status="healthy",
-        cnn_model_loaded=cnn_classifier is not None,
+        image_model_loaded=image_classifier is not None,
+        image_model_type=model_type,
         sklearn_model_loaded=sklearn_classifier is not None
     )
 
@@ -275,10 +307,10 @@ async def predict_image(
 
     Returns classification result with confidence scores.
     """
-    if cnn_classifier is None:
+    if image_classifier is None:
         raise HTTPException(
             status_code=503,
-            detail="CNN model not loaded. Please ensure best_model.pth exists in checkpoints/"
+            detail="Image model not loaded. Please train and save a YOLOv11 or CNN model first."
         )
 
     allowed_types = ["image/png", "image/jpeg", "image/jpg"]
@@ -291,7 +323,7 @@ async def predict_image(
     try:
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
-        result = cnn_classifier.predict(image, return_proba=True)
+        result = image_classifier.predict(image, return_proba=True)
 
         return PredictionResponse(
             success=True,
@@ -465,10 +497,10 @@ async def predict_batch(
 
     Upload multiple images and receive predictions for each.
     """
-    if cnn_classifier is None:
+    if image_classifier is None:
         raise HTTPException(
             status_code=503,
-            detail="CNN model not loaded."
+            detail="Image model not loaded. Please train and save a YOLOv11 or CNN model first."
         )
 
     results = []
@@ -477,7 +509,7 @@ async def predict_batch(
         try:
             contents = await file.read()
             image = Image.open(io.BytesIO(contents)).convert("RGB")
-            result = cnn_classifier.predict(image, return_proba=True)
+            result = image_classifier.predict(image, return_proba=True)
             results.append({
                 "filename": file.filename,
                 "success": True,
@@ -522,10 +554,10 @@ async def predict_patient_images(
 
     Upload thermal images for both left and right feet.
     """
-    if cnn_classifier is None:
+    if image_classifier is None:
         raise HTTPException(
             status_code=503,
-            detail="CNN model not loaded. Please ensure best_model.pth exists in checkpoints/"
+            detail="Image model not loaded. Please train and save a YOLOv11 or CNN model first."
         )
 
     allowed_types = ["image/png", "image/jpeg", "image/jpg"]
@@ -547,7 +579,7 @@ async def predict_patient_images(
 
         # Get predictions using predict_patient
         result = predict_patient(
-            cnn_classifier=cnn_classifier,
+            cnn_classifier=image_classifier,
             sklearn_classifier=sklearn_classifier,
             left_image=left_image,
             right_image=right_image
@@ -629,7 +661,7 @@ async def predict_patient_csv(
 
         # Get predictions using predict_patient
         result = predict_patient(
-            cnn_classifier=cnn_classifier,
+            cnn_classifier=image_classifier,
             sklearn_classifier=sklearn_classifier,
             left_csv=left_temp_path,
             right_csv=right_temp_path,
@@ -723,7 +755,7 @@ async def predict_patient_temperature(
 
         # Get predictions using predict_patient
         result = predict_patient(
-            cnn_classifier=cnn_classifier,
+            cnn_classifier=image_classifier,
             sklearn_classifier=sklearn_classifier,
             left_csv=left_temp_path,
             right_csv=right_temp_path,

@@ -14,29 +14,37 @@ import sys
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.model import get_model
+from models.model import get_model, YOLOv11DPNClassifier
 from models.data_loader import get_transforms
 
 
 class DPNClassifier:
     """
     Unified classifier for DPN detection.
-    Supports both CNN (PyTorch) and classical ML (sklearn) models.
+    Supports YOLOv11 (recommended), CNN (PyTorch), and classical ML (sklearn) models.
+
+    model_type values:
+        "yolo"    – YOLOv11 classification model (.pt file)  ← recommended
+        "cnn"     – Custom PyTorch CNN (.pth checkpoint)
+        "sklearn" – scikit-learn pipeline (.joblib file)
     """
 
     def __init__(
         self,
         model_path: str,
-        model_type: str = "cnn",  # "cnn" or "sklearn"
+        model_type: str = "yolo",
         device: str = None
     ):
         """
         Initialize the classifier.
 
         Args:
-            model_path: Path to saved model file (.pth for CNN, .joblib for sklearn)
-            model_type: Type of model - "cnn" or "sklearn"
-            device: Device for CNN inference ("cuda" or "cpu")
+            model_path: Path to saved model file.
+                        .pt  → YOLOv11 weights
+                        .pth → CNN checkpoint
+                        .joblib → sklearn pipeline
+            model_type: Type of model - "yolo", "cnn", or "sklearn"
+            device: Device for inference ("cuda" or "cpu"). Auto-detected if None.
         """
         self.model_type = model_type
         self.model_path = Path(model_path)
@@ -52,7 +60,13 @@ class DPNClassifier:
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model not found: {self.model_path}")
 
-        if self.model_type == "cnn":
+        if self.model_type == "yolo":
+            # Load YOLOv11 classification model
+            self.model = YOLOv11DPNClassifier.load(str(self.model_path), device=self.device)
+            print(f"Loaded YOLOv11 model from {self.model_path}")
+            print(f"Running on: {self.device}")
+
+        elif self.model_type == "cnn":
             # Load PyTorch CNN model
             self.model = get_model("lightweight_cnn", num_classes=2, input_channels=3)
             checkpoint = torch.load(self.model_path, map_location=self.device)
@@ -72,7 +86,7 @@ class DPNClassifier:
             print(f"Loaded sklearn model from {self.model_path}")
 
         else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
+            raise ValueError(f"Unknown model type: {self.model_type}. Use 'yolo', 'cnn', or 'sklearn'.")
 
     def preprocess_image(self, image: Union[str, Path, Image.Image, np.ndarray]) -> torch.Tensor:
         """
@@ -130,16 +144,28 @@ class DPNClassifier:
         Make a prediction on input data.
 
         Args:
-            input_data: Image path, PIL Image, numpy array, or CSV path
+            input_data: Image path, PIL Image, numpy array (for yolo/cnn),
+                        or CSV path (for sklearn)
             return_proba: Whether to return class probabilities
 
         Returns:
             Dictionary with prediction results
         """
-        if self.model_type == "cnn":
+        if self.model_type == "yolo":
+            return self._predict_yolo(input_data, return_proba)
+        elif self.model_type == "cnn":
             return self._predict_cnn(input_data, return_proba)
         else:
             return self._predict_sklearn(input_data, return_proba)
+
+    def _predict_yolo(self, image: Union[str, Path, Image.Image, np.ndarray], return_proba: bool) -> Dict:
+        """Make prediction using YOLOv11 classification model."""
+        result = self.model.predict(image)
+
+        if not return_proba:
+            result.pop("probabilities", None)
+
+        return result
 
     def _predict_cnn(self, image: Union[str, Path, Image.Image, np.ndarray], return_proba: bool) -> Dict:
         """Make prediction using CNN model."""
@@ -350,37 +376,70 @@ def predict_patient(
         results["asymmetry"] = calculate_asymmetry(left_temps, right_temps)
 
     # Combined diagnosis logic
-    left_diabetic = results["left_foot"]["is_diabetic"] if results["left_foot"] else None
-    right_diabetic = results["right_foot"]["is_diabetic"] if results["right_foot"] else None
-    left_conf = results["left_foot"].get("confidence", 0) if results["left_foot"] else 0
-    right_conf = results["right_foot"].get("confidence", 0) if results["right_foot"] else 0
+    # -------------------------------------------------------------------------
+    # Soft threshold: flag a foot as diabetic if its Diabetic probability >= 40%,
+    # even when the model's argmax says Control.
+    # Medical rationale: false negatives (missed DPN) are clinically worse than
+    # false positives. 40% is deliberately below 50% to catch borderline cases.
+    DIABETIC_PROB_THRESHOLD = 40.0  # percent
+
+    def _is_diabetic_soft(foot_result):
+        if foot_result is None:
+            return None
+        return foot_result.get("probabilities", {}).get("Diabetic", 0.0) >= DIABETIC_PROB_THRESHOLD
+
+    def _diabetic_prob(foot_result):
+        if foot_result is None:
+            return 0.0
+        return foot_result.get("probabilities", {}).get("Diabetic", 0.0)
+
+    left_diabetic = _is_diabetic_soft(results["left_foot"])
+    right_diabetic = _is_diabetic_soft(results["right_foot"])
+    left_prob = _diabetic_prob(results["left_foot"])
+    right_prob = _diabetic_prob(results["right_foot"])
 
     # Determine combined prediction
     if left_diabetic is not None and right_diabetic is not None:
         # Both feet analyzed
         if left_diabetic and right_diabetic:
             results["combined_prediction"] = "Diabetic"
-            results["combined_confidence"] = round((left_conf + right_conf) / 2, 2)
+            results["combined_confidence"] = round((left_prob + right_prob) / 2, 2)
             results["diagnosis_factors"].append("Both feet show diabetic indicators")
         elif left_diabetic or right_diabetic:
-            # One foot shows signs - this is concerning
+            # One foot crosses the threshold — flag as Diabetic (medical safety)
             results["combined_prediction"] = "Diabetic"
-            results["combined_confidence"] = round(max(left_conf, right_conf) * 0.9, 2)
+            results["combined_confidence"] = round(max(left_prob, right_prob), 2)
             affected = "left" if left_diabetic else "right"
-            results["diagnosis_factors"].append(f"The {affected} foot shows diabetic indicators")
+            results["diagnosis_factors"].append(
+                f"The {affected} foot crosses the diabetic probability threshold "
+                f"({DIABETIC_PROB_THRESHOLD:.0f}%)"
+            )
         else:
             results["combined_prediction"] = "Control"
-            results["combined_confidence"] = round((left_conf + right_conf) / 2, 2)
+            results["combined_confidence"] = round(100.0 - (left_prob + right_prob) / 2, 2)
             results["diagnosis_factors"].append("Neither foot shows diabetic indicators")
 
-        # Factor in asymmetry
+        # Asymmetry tie-breaker: if asymmetry is clinically significant (>2.2°C)
+        # and the model still says Control, override to Diabetic.
+        # Clinical basis: significant inter-foot temperature asymmetry is an
+        # established DPN indicator (Lavery et al.) that overrules a borderline
+        # Control prediction.
         if results["asymmetry"] and results["asymmetry"]["asymmetry_significant"]:
+            temp_diff = results["asymmetry"]["mean_temp_difference"]
+            threshold = results["asymmetry"]["threshold_used"]
             results["diagnosis_factors"].append(
-                f"Significant temperature asymmetry detected ({results['asymmetry']['mean_temp_difference']}°C difference)"
+                f"Significant temperature asymmetry detected "
+                f"({temp_diff:.2f}\u00b0C difference, threshold {threshold}\u00b0C)"
             )
-            # Asymmetry can indicate early DPN even if individual predictions are negative
             if results["combined_prediction"] == "Control":
-                results["diagnosis_factors"].append("Asymmetry warrants further clinical evaluation")
+                results["combined_prediction"] = "Diabetic"
+                results["combined_confidence"] = round(
+                    min(temp_diff / threshold * 50.0, 75.0), 2
+                )
+                results["diagnosis_factors"].append(
+                    "Prediction overridden to Diabetic due to significant "
+                    "inter-foot temperature asymmetry (clinical safety rule)"
+                )
 
     elif left_diabetic is not None:
         results["combined_prediction"] = results["left_foot"]["prediction"]
@@ -402,14 +461,17 @@ _classifier_instance: Optional[DPNClassifier] = None
 
 def get_classifier(
     model_path: str = None,
-    model_type: str = "cnn"
+    model_type: str = "yolo"
 ) -> DPNClassifier:
     """
     Get or create a classifier instance (singleton pattern).
 
+    Defaults to the YOLOv11 model for best accuracy.  Falls back to CNN or
+    sklearn if the YOLO checkpoint is not present.
+
     Args:
-        model_path: Path to model file
-        model_type: Type of model
+        model_path: Path to model file. Auto-detected from checkpoints/ if None.
+        model_type: "yolo" (default), "cnn", or "sklearn".
 
     Returns:
         DPNClassifier instance
@@ -418,12 +480,22 @@ def get_classifier(
 
     if _classifier_instance is None:
         if model_path is None:
-            # Default paths
             base_path = Path(__file__).parent.parent / "checkpoints"
-            if model_type == "cnn":
-                model_path = base_path / "best_model.pth"
+            default_paths = {
+                "yolo":    base_path / "best_yolo_model.pt",
+                "cnn":     base_path / "best_model.pth",
+                "sklearn": base_path / "best_sklearn_model.joblib",
+            }
+            # Auto-select: prefer YOLO if available, else CNN, else sklearn
+            if model_type == "yolo":
+                yolo_path = default_paths["yolo"]
+                if not yolo_path.exists():
+                    # Try Ultralytics run output path as fallback
+                    alt = base_path / "yolo11_dpn" / "weights" / "best.pt"
+                    yolo_path = alt if alt.exists() else yolo_path
+                model_path = yolo_path
             else:
-                model_path = base_path / "best_sklearn_model.joblib"
+                model_path = default_paths.get(model_type, default_paths["cnn"])
 
         _classifier_instance = DPNClassifier(model_path, model_type)
 

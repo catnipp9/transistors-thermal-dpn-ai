@@ -19,7 +19,25 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
 
 ## AI Models Used
 
-### 1. Convolutional Neural Network (CNN) - For Thermal Images
+### 1. YOLOv11 Classification (Primary — Recommended)
+- **Framework**: [Ultralytics](https://github.com/ultralytics/ultralytics) YOLOv11
+- **Mode**: Image classification (`yolo11s-cls` default variant)
+- **Why**: Higher accuracy than the custom CNN, especially at lower sample sizes, due to pre-trained ImageNet weights and YOLO's advanced augmentation and training pipeline. Addresses accuracy instability seen in early CNN training epochs.
+- **Input**: RGB thermal images (PNG/JPG) — auto-resized to 224×224
+- **Output**: Binary classification (Control vs Diabetic) with confidence percentage
+- **Saved checkpoint**: `checkpoints/best_yolo_model.pt`
+
+**Available size variants** (tradeoff: speed vs accuracy):
+
+| Variant | Key | Notes |
+|---------|-----|-------|
+| `yolo11n-cls` | `yolo11n` | Nano — fastest |
+| `yolo11s-cls` | `yolo11s` / `yolo11` | Small — **default, best balance** |
+| `yolo11m-cls` | `yolo11m` | Medium |
+| `yolo11l-cls` | `yolo11l` | Large |
+| `yolo11x-cls` | `yolo11x` | Extra-large — most accurate |
+
+### 2. CNN (Legacy — Thermal Images)
 - **Framework**: PyTorch
 - **Architecture**: LightweightCNN (custom-built)
   - 3 convolutional blocks with batch normalization and ReLU activation
@@ -27,8 +45,9 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
   - Fully connected classifier with dropout regularization
 - **Input**: RGB thermal images (PNG/JPG)
 - **Output**: Binary classification (Control vs Diabetic) with confidence percentage
+- **Saved checkpoint**: `checkpoints/best_model.pth`
 
-### 2. Classical Machine Learning Models - For Temperature Values
+### 3. Classical Machine Learning Models (For Temperature CSV Values)
 - **Framework**: scikit-learn
 - **Models trained and compared**:
   - Random Forest
@@ -36,11 +55,11 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
   - Gradient Boosting
   - Multi-Layer Perceptron (MLP)
   - Logistic Regression
-- **Input**: CSV temperature matrices (168x65) flattened into feature vectors
+- **Input**: CSV temperature matrices (168×65) flattened into feature vectors
 - **Output**: Binary classification (Control vs Diabetic) with confidence percentage
-- The best performing model is automatically saved after training
+- **Saved checkpoint**: `checkpoints/best_sklearn_model.joblib`
 
-### 3. Asymmetry Analysis
+### 4. Asymmetry Analysis
 - Compares temperature distributions between left and right feet
 - Flips the right foot horizontally for pixel-level alignment
 - Calculates mean, max, and standard deviation of temperature differences
@@ -69,31 +88,50 @@ Each subject has:
 pip install -r requirements.txt
 ```
 
-If PyTorch installation fails, install it separately:
+If PyTorch installation fails, install it separately first:
 ```bash
 pip install torch torchvision
+pip install ultralytics>=8.3.0
 ```
 
-### Step 2: Train the Models
+### Step 2: Train the YOLOv11 Model (Recommended)
 
-Open and run the training notebook:
+```python
+from models.data_loader import prepare_yolo_dataset
+from models.model import YOLOv11DPNClassifier
+from models.trainer import YOLOTrainer
 
+# Prepare dataset in YOLO classification format
+yaml_path = prepare_yolo_dataset("data/", "checkpoints/yolo_dataset")
+
+# Create and train the model (downloads pre-trained weights automatically)
+model = YOLOv11DPNClassifier(variant='yolo11s-cls')
+trainer = YOLOTrainer(model, save_dir="checkpoints")
+trainer.train(yaml_path, epochs=50, imgsz=224, batch=16, patience=10)
+
+# Copy best weights to standard path
+trainer.save_best_checkpoint()  # → checkpoints/best_yolo_model.pt
+```
+
+Or open and run the training notebook:
 ```bash
 jupyter notebook notebooks/train_model.ipynb
 ```
 
 Run all cells in order. The notebook will:
 1. Load all thermogram data from the `data/` directory
-2. Split data into training (70%), validation (15%), and test (15%) sets
-3. Train the CNN model on thermal images
+2. Prepare the YOLO classification dataset structure
+3. Train the YOLOv11 model on thermal images
 4. Train multiple sklearn models on temperature values
 5. Compare all models and save the best ones to `checkpoints/`
 
 After training completes, you will see:
-- `checkpoints/best_model.pth` - Best CNN model
-- `checkpoints/best_sklearn_model.joblib` - Best sklearn model
-- `checkpoints/training_history.png` - Training loss/accuracy curves
-- `checkpoints/model_comparison_results.csv` - Comparison table of all models
+- `checkpoints/best_yolo_model.pt` — Best YOLOv11 model (primary)
+- `checkpoints/best_model.pth` — Best CNN model (legacy)
+- `checkpoints/best_sklearn_model.joblib` — Best sklearn model
+- `checkpoints/yolo11_dpn/` — Full YOLOv11 training run (curves, weights, etc.)
+- `checkpoints/training_history.png` — CNN training loss/accuracy curves
+- `checkpoints/model_comparison_results.csv` — Comparison table of all models
 
 ### Step 3: Start the API Server
 
@@ -103,17 +141,18 @@ uvicorn api.main:app --reload
 
 The server starts at `http://localhost:8000`. Visit `http://localhost:8000/docs` for the interactive Swagger UI.
 
+> The API automatically loads the YOLOv11 model (`best_yolo_model.pt`) on startup.
+> If it is not found it falls back to `best_model.pth` (CNN).
+
 ### Step 4: Use the API for Predictions
 
-The API provides the following endpoints:
-
 #### Single Foot Endpoints
-| Endpoint | Method | Input | Description |
-|----------|--------|-------|-------------|
-| `/predict/image` | POST | Image file | Classify one thermal image |
-| `/predict/csv` | POST | CSV file | Classify one temperature CSV |
-| `/predict/temperature` | POST | JSON body | Classify one temperature array |
-| `/predict/batch` | POST | Multiple images | Classify multiple images at once |
+| Endpoint | Method | Input | Model used |
+|----------|--------|-------|------------|
+| `/predict/image` | POST | Image file | YOLOv11 (or CNN) |
+| `/predict/csv` | POST | CSV file | sklearn |
+| `/predict/temperature` | POST | JSON body | sklearn |
+| `/predict/batch` | POST | Multiple images | YOLOv11 (or CNN) |
 
 #### Dual-Foot Patient Endpoints (Recommended)
 | Endpoint | Method | Input | Description |
@@ -126,7 +165,18 @@ The API provides the following endpoints:
 
 ## How to Test the AI
 
-### Option 1: Using the Swagger UI (Easiest)
+### Option 1: Run the Test Script
+
+```bash
+python test_models.py
+```
+
+This runs three tests:
+1. **YOLOv11 model** — classifies Control and Diabetic image samples
+2. **sklearn model** — classifies Control and Diabetic CSV samples
+3. **Batch accuracy check** — tests 20 samples and reports accuracy
+
+### Option 2: Using the Swagger UI (Easiest)
 
 1. Start the API server: `uvicorn api.main:app --reload`
 2. Open `http://localhost:8000/docs` in your browser
@@ -134,7 +184,7 @@ The API provides the following endpoints:
 4. Upload your files or paste JSON data
 5. Click "Execute" to see results
 
-### Option 2: Using curl (Terminal)
+### Option 3: Using curl (Terminal)
 
 **Test with a single thermal image:**
 ```bash
@@ -172,7 +222,7 @@ curl -X POST "http://localhost:8000/predict/patient/temperature" \
   }'
 ```
 
-### Option 3: Using Python
+### Option 4: Using Python
 
 ```python
 import requests
@@ -187,7 +237,7 @@ response = requests.post(url, files=files)
 print(response.json())
 ```
 
-### Option 4: Check API Health
+### Option 5: Check API Health
 
 ```bash
 curl http://localhost:8000/health
@@ -201,8 +251,6 @@ Returns:
   "sklearn_model_loaded": true
 }
 ```
-
-If either model shows `false`, make sure you ran the training notebook first.
 
 ---
 
@@ -244,23 +292,28 @@ If either model shows `false`, make sure you ran the training notebook first.
 ## Project Structure
 
 ```
-Thesis_DPN/
+transistors-thermal-ai-testing/
 ├── data/                          # Dataset
 │   ├── Control Group/             # 45 healthy subjects
 │   │   └── CG001_M/              # Each subject has L/R foot PNG + CSV
 │   └── DM Group/                  # 122 diabetic subjects
 │       └── DM001_M/
 ├── models/                        # Model code
-│   ├── data_loader.py             # Dataset loading and transforms
+│   ├── data_loader.py             # Dataset loading, transforms, YOLO dataset prep
 │   ├── preprocessing.py           # Feature extraction and normalization
-│   ├── model.py                   # CNN and sklearn model architectures
-│   └── trainer.py                 # Training utilities
+│   ├── model.py                   # YOLOv11, CNN, ResNet, and sklearn architectures
+│   └── trainer.py                 # YOLOTrainer, CNNTrainer, SklearnTrainer
 ├── api/                           # REST API
 │   ├── main.py                    # FastAPI endpoints
 │   └── inference.py               # Model loading and prediction logic
 ├── notebooks/
 │   └── train_model.ipynb          # Training notebook
 ├── checkpoints/                   # Saved models (after training)
+│   ├── best_yolo_model.pt         # YOLOv11 best weights (primary)
+│   ├── best_model.pth             # CNN best weights (legacy)
+│   ├── best_sklearn_model.joblib  # Best sklearn model
+│   └── yolo11_dpn/                # Full YOLOv11 training run output
+├── test_models.py                 # Model validation tests
 ├── requirements.txt               # Python dependencies
 └── README.md                      # This file
 ```

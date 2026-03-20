@@ -13,6 +13,9 @@ opencv-python>=4.9.0
 torch>=2.2.0
 torchvision>=0.17.0
 
+# YOLOv11 (Ultralytics)
+ultralytics>=8.3.0
+
 # Visualization
 matplotlib>=3.8.0
 seaborn>=0.13.0

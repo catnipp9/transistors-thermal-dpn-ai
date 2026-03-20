@@ -336,6 +336,139 @@ class SklearnTrainer:
             raise ValueError("Model does not support probability predictions")
 
 
+class YOLOTrainer:
+    """
+    Trainer class for YOLOv11 classification models.
+
+    Wraps the Ultralytics training pipeline so it integrates cleanly with the
+    rest of the project's trainer API.  Training is delegated entirely to
+    Ultralytics (handles augmentation, mixed precision, early stopping, etc.).
+
+    Example
+    -------
+    >>> from models.model import YOLOv11DPNClassifier
+    >>> from models.data_loader import prepare_yolo_dataset
+    >>> yaml_path = prepare_yolo_dataset("data/", "checkpoints/yolo_dataset")
+    >>> model = YOLOv11DPNClassifier(variant='yolo11s-cls')
+    >>> trainer = YOLOTrainer(model)
+    >>> history = trainer.train(yaml_path, epochs=50)
+    >>> metrics = trainer.evaluate(yaml_path)
+    """
+
+    def __init__(self, model, save_dir: str = "checkpoints"):
+        """
+        Args:
+            model: YOLOv11DPNClassifier instance.
+            save_dir: Root directory for saving training results and checkpoints.
+        """
+        self.model = model
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.results = None
+
+    def train(
+        self,
+        data_yaml: str,
+        epochs: int = 50,
+        imgsz: int = 224,
+        batch: int = 16,
+        lr0: float = 0.001,
+        patience: int = 10,
+        **kwargs
+    ) -> Dict:
+        """
+        Train the YOLOv11 model.
+
+        Args:
+            data_yaml: Path to the YOLO classification dataset YAML.
+            epochs: Maximum number of training epochs.
+            imgsz: Square image size used by YOLO (images are auto-resized).
+            batch: Batch size.
+            lr0: Initial learning rate.
+            patience: Early-stopping patience (epochs without val-loss improvement).
+            **kwargs: Additional keyword arguments forwarded to YOLOv11DPNClassifier.train().
+
+        Returns:
+            Dict summarising training (best validation metrics from Ultralytics results).
+        """
+        print(f"Training YOLOv11 ({self.model.variant}) on {self.model.device}")
+        print(f"Dataset YAML: {data_yaml}")
+        print(f"Epochs: {epochs} | Batch: {batch} | imgsz: {imgsz} | patience: {patience}")
+        print("-" * 50)
+
+        self.results = self.model.train(
+            data_yaml=data_yaml,
+            epochs=epochs,
+            imgsz=imgsz,
+            batch=batch,
+            lr0=lr0,
+            patience=patience,
+            save_dir=str(self.save_dir),
+            **kwargs
+        )
+
+        # Best weights are saved by Ultralytics at:
+        # <save_dir>/yolo11_dpn/weights/best.pt
+        best_weights = self.save_dir / "yolo11_dpn" / "weights" / "best.pt"
+        print(f"\nTraining complete. Best weights: {best_weights}")
+
+        # Build a history-style summary from Ultralytics results object
+        history: Dict = {}
+        if self.results is not None:
+            try:
+                history["top1_accuracy"] = float(self.results.results_dict.get("metrics/accuracy_top1", 0))
+                history["top5_accuracy"] = float(self.results.results_dict.get("metrics/accuracy_top5", 0))
+            except Exception:
+                pass
+
+        return history
+
+    def evaluate(self, data_yaml: str) -> Dict:
+        """
+        Evaluate the trained model on the validation split.
+
+        Args:
+            data_yaml: Path to the YOLO classification dataset YAML.
+
+        Returns:
+            Dict with accuracy_top1, accuracy_top5.
+        """
+        # Classify mode requires the dataset directory, not a YAML file
+        data_path = Path(data_yaml)
+        if data_path.suffix in {".yaml", ".yml"}:
+            data_path = data_path.parent
+        val_results = self.model.model.val(data=str(data_path), device=self.model.device, verbose=False)
+
+        metrics: Dict = {}
+        try:
+            metrics["top1_accuracy"] = float(val_results.results_dict.get("metrics/accuracy_top1", 0))
+            metrics["top5_accuracy"] = float(val_results.results_dict.get("metrics/accuracy_top5", 0))
+        except Exception:
+            pass
+
+        print_metrics(metrics, title="YOLOv11 Evaluation Results")
+        return metrics
+
+    def save_best_checkpoint(self, dest_path: str = None):
+        """
+        Copy the best Ultralytics checkpoint to a standardised path.
+
+        Args:
+            dest_path: Destination path for the best .pt file.
+                       Defaults to <save_dir>/best_yolo_model.pt.
+        """
+        import shutil
+
+        src = self.save_dir / "yolo11_dpn" / "weights" / "best.pt"
+        dst = Path(dest_path) if dest_path else self.save_dir / "best_yolo_model.pt"
+
+        if src.exists():
+            shutil.copy2(src, dst)
+            print(f"Best YOLO checkpoint copied to: {dst}")
+        else:
+            print(f"Warning: best.pt not found at {src}")
+
+
 def cross_validate_sklearn(
     model,
     X: np.ndarray,
