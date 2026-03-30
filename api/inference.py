@@ -271,9 +271,11 @@ def calculate_asymmetry(
     right_mean = float(np.mean(right_temps))
     mean_temp_diff = abs(left_mean - right_mean)
 
-    # Clinical threshold: >2.2°C difference is often considered significant
+    # Clinical threshold: mean inter-foot temperature difference >2.2°C AND
+    # mean pixel-level asymmetry >1.0°C. Requiring both prevents a single
+    # hotspot from triggering a false positive asymmetry flag.
     ASYMMETRY_THRESHOLD = 2.2
-    is_significant = mean_temp_diff > ASYMMETRY_THRESHOLD or max_asymmetry > (ASYMMETRY_THRESHOLD * 2)
+    is_significant = mean_temp_diff > ASYMMETRY_THRESHOLD and mean_asymmetry > 1.0
 
     return {
         "mean_asymmetry": round(mean_asymmetry, 3),
@@ -377,53 +379,56 @@ def predict_patient(
 
     # Combined diagnosis logic
     # -------------------------------------------------------------------------
-    # Soft threshold: flag a foot as diabetic if its Diabetic probability >= 40%,
-    # even when the model's argmax says Control.
-    # Medical rationale: false negatives (missed DPN) are clinically worse than
-    # false positives. 40% is deliberately below 50% to catch borderline cases.
-    DIABETIC_PROB_THRESHOLD = 40.0  # percent
-
-    def _is_diabetic_soft(foot_result):
-        if foot_result is None:
-            return None
-        return foot_result.get("probabilities", {}).get("Diabetic", 0.0) >= DIABETIC_PROB_THRESHOLD
-
+    # Both feet must independently cross the diabetic threshold for a Diabetic
+    # result. This prevents false positives from borderline single-foot readings.
+    # If only one foot is flagged, it is noted but NOT enough alone to diagnose.
+    # The model's own argmax (>50%) is used as the primary decision boundary.
     def _diabetic_prob(foot_result):
         if foot_result is None:
             return 0.0
         return foot_result.get("probabilities", {}).get("Diabetic", 0.0)
 
-    left_diabetic = _is_diabetic_soft(results["left_foot"])
-    right_diabetic = _is_diabetic_soft(results["right_foot"])
+    def _is_diabetic(foot_result):
+        """Use the model's own argmax decision — no soft thresholding."""
+        if foot_result is None:
+            return None
+        return foot_result.get("is_diabetic", False)
+
+    left_diabetic = _is_diabetic(results["left_foot"])
+    right_diabetic = _is_diabetic(results["right_foot"])
     left_prob = _diabetic_prob(results["left_foot"])
     right_prob = _diabetic_prob(results["right_foot"])
 
     # Determine combined prediction
     if left_diabetic is not None and right_diabetic is not None:
-        # Both feet analyzed
+        # Both feet analyzed — require BOTH to be diabetic for a positive result
         if left_diabetic and right_diabetic:
             results["combined_prediction"] = "Diabetic"
             results["combined_confidence"] = round((left_prob + right_prob) / 2, 2)
             results["diagnosis_factors"].append("Both feet show diabetic indicators")
         elif left_diabetic or right_diabetic:
-            # One foot crosses the threshold — flag as Diabetic (medical safety)
-            results["combined_prediction"] = "Diabetic"
-            results["combined_confidence"] = round(max(left_prob, right_prob), 2)
+            # Only one foot is positive — flag for review but do NOT diagnose as Diabetic
             affected = "left" if left_diabetic else "right"
+            affected_prob = left_prob if left_diabetic else right_prob
+            results["combined_prediction"] = "Control"
+            results["combined_confidence"] = round(
+                100.0 - (left_prob + right_prob) / 2, 2
+            )
             results["diagnosis_factors"].append(
-                f"The {affected} foot crosses the diabetic probability threshold "
-                f"({DIABETIC_PROB_THRESHOLD:.0f}%)"
+                f"The {affected} foot shows some diabetic indicators "
+                f"({affected_prob:.1f}% probability) — further evaluation recommended"
             )
         else:
             results["combined_prediction"] = "Control"
             results["combined_confidence"] = round(100.0 - (left_prob + right_prob) / 2, 2)
             results["diagnosis_factors"].append("Neither foot shows diabetic indicators")
 
-        # Asymmetry tie-breaker: if asymmetry is clinically significant (>2.2°C)
-        # and the model still says Control, override to Diabetic.
-        # Clinical basis: significant inter-foot temperature asymmetry is an
-        # established DPN indicator (Lavery et al.) that overrules a borderline
-        # Control prediction.
+        # Asymmetry as supporting evidence — only upgrades a borderline Control
+        # to Diabetic when BOTH of these are true:
+        #   1. The inter-foot mean temperature difference exceeds 2.2°C AND
+        #   2. At least one foot already has a Diabetic probability > 60%
+        # This prevents healthy patients with naturally asymmetric feet from
+        # being falsely flagged.
         if results["asymmetry"] and results["asymmetry"]["asymmetry_significant"]:
             temp_diff = results["asymmetry"]["mean_temp_difference"]
             threshold = results["asymmetry"]["threshold_used"]
@@ -431,14 +436,13 @@ def predict_patient(
                 f"Significant temperature asymmetry detected "
                 f"({temp_diff:.2f}\u00b0C difference, threshold {threshold}\u00b0C)"
             )
-            if results["combined_prediction"] == "Control":
+            high_prob_foot = max(left_prob, right_prob)
+            if results["combined_prediction"] == "Control" and high_prob_foot > 60.0:
                 results["combined_prediction"] = "Diabetic"
-                results["combined_confidence"] = round(
-                    min(temp_diff / threshold * 50.0, 75.0), 2
-                )
+                results["combined_confidence"] = round(high_prob_foot, 2)
                 results["diagnosis_factors"].append(
-                    "Prediction overridden to Diabetic due to significant "
-                    "inter-foot temperature asymmetry (clinical safety rule)"
+                    "Upgraded to Diabetic: significant asymmetry combined with "
+                    f"elevated diabetic probability ({high_prob_foot:.1f}%) on one foot"
                 )
 
     elif left_diabetic is not None:

@@ -349,17 +349,25 @@ class YOLOv11DPNClassifier:
         # Augmentation defaults tuned for small thermal foot images.
         # Any can be overridden by the caller via **kwargs.
         augmentation_defaults = dict(
+            # Geometric
             fliplr=0.5,       # horizontal flip — left/right foot mirror symmetry
             flipud=0.0,       # no vertical flip — foot orientation matters
             degrees=15,       # rotation ±15° for camera tilt variation
             translate=0.1,    # translate ±10%
             scale=0.2,        # scale ±20%
             shear=5.0,        # shear ±5°
-            hsv_h=0.015,      # hue shift for colourmap variation
-            hsv_s=0.4,        # saturation shift
-            hsv_v=0.4,        # brightness shift
+            # Colour / intensity (thermal colourmap variation)
+            hsv_h=0.015,
+            hsv_s=0.4,
+            hsv_v=0.4,
+            # Regularisation
             erasing=0.3,      # random erasing — simulates partial occlusion
             mixup=0.1,        # mixup helps generalise on small datasets
+            # LR schedule — cosine annealing prevents getting stuck in local minima
+            cos_lr=True,
+            # Optimizer
+            weight_decay=0.0005,
+            warmup_epochs=5,   # longer warmup stabilises early training
         )
         augmentation_defaults.update(kwargs)
 

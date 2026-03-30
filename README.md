@@ -21,7 +21,7 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
 
 ### 1. YOLOv11 Classification (Primary — Recommended)
 - **Framework**: [Ultralytics](https://github.com/ultralytics/ultralytics) YOLOv11
-- **Mode**: Image classification (`yolo11s-cls` default variant)
+- **Mode**: Image classification (`yolo11m-cls` default variant)
 - **Why**: Higher accuracy than the custom CNN, especially at lower sample sizes, due to pre-trained ImageNet weights and YOLO's advanced augmentation and training pipeline. Addresses accuracy instability seen in early CNN training epochs.
 - **Input**: RGB thermal images (PNG/JPG) — auto-resized to 224×224
 - **Output**: Binary classification (Control vs Diabetic) with confidence percentage
@@ -32,8 +32,8 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
 | Variant | Key | Notes |
 |---------|-----|-------|
 | `yolo11n-cls` | `yolo11n` | Nano — fastest |
-| `yolo11s-cls` | `yolo11s` / `yolo11` | Small — **default, best balance** |
-| `yolo11m-cls` | `yolo11m` | Medium |
+| `yolo11s-cls` | `yolo11s` / `yolo11` | Small — fastest on CPU |
+| `yolo11m-cls` | `yolo11m` | Medium — **default, best balance** |
 | `yolo11l-cls` | `yolo11l` | Large |
 | `yolo11x-cls` | `yolo11x` | Extra-large — most accurate |
 
@@ -59,11 +59,16 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
 - **Output**: Binary classification (Control vs Diabetic) with confidence percentage
 - **Saved checkpoint**: `checkpoints/best_sklearn_model.joblib`
 
-### 4. Asymmetry Analysis
+### 4. Dual-Foot Diagnosis Logic
+- **Both feet must independently predict Diabetic** for a Diabetic result
+- A single diabetic foot is flagged as "further evaluation recommended" — not a positive diagnosis
+- Asymmetry only upgrades a Control result when: mean temp diff >2.2°C **and** the higher-probability foot exceeds 60% Diabetic probability
+- This prevents false positives from borderline or naturally asymmetric healthy feet
+
+### 5. Asymmetry Analysis
 - Compares temperature distributions between left and right feet
 - Flips the right foot horizontally for pixel-level alignment
-- Calculates mean, max, and standard deviation of temperature differences
-- Clinical threshold: >2.2 degrees Celsius flags significant asymmetry
+- Significance requires **both**: mean inter-foot difference >2.2°C and mean pixel asymmetry >1.0°C
 
 ---
 
@@ -286,6 +291,29 @@ Returns:
   "diagnosis_factors": ["Both feet show diabetic indicators"]
 }
 ```
+
+---
+
+## Git Workflow
+
+### Commit and push changes
+
+```bash
+# 1. Check what changed
+git status
+git diff
+
+# 2. Stage only source files — never stage checkpoints or data
+git add models/model.py models/data_loader.py api/inference.py api/main.py
+
+# 3. Commit with a descriptive message
+git commit -m "your message here"
+
+# 4. Push to GitHub
+git push origin main
+```
+
+> **Never commit** `checkpoints/` (model weights) or `data/` (thermogram dataset) — they are large binary files already covered by `.gitignore`.
 
 ---
 
