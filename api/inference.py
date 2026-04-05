@@ -389,10 +389,14 @@ def predict_patient(
         return foot_result.get("probabilities", {}).get("Diabetic", 0.0)
 
     def _is_diabetic(foot_result):
-        """Use the model's own argmax decision — no soft thresholding."""
+        """Flag as diabetic if Diabetic probability >= 45%.
+        Slightly below 50% to catch borderline cases where the model is
+        nearly split — a 48% Diabetic reading is clinically concerning
+        and should not be silently classified as Control."""
         if foot_result is None:
             return None
-        return foot_result.get("is_diabetic", False)
+        diabetic_prob = foot_result.get("probabilities", {}).get("Diabetic", 0.0)
+        return diabetic_prob >= 45.0
 
     left_diabetic = _is_diabetic(results["left_foot"])
     right_diabetic = _is_diabetic(results["right_foot"])
@@ -407,17 +411,26 @@ def predict_patient(
             results["combined_confidence"] = round((left_prob + right_prob) / 2, 2)
             results["diagnosis_factors"].append("Both feet show diabetic indicators")
         elif left_diabetic or right_diabetic:
-            # Only one foot is positive — flag for review but do NOT diagnose as Diabetic
+            # One foot crosses threshold — but also check if combined average is high
+            avg_prob = (left_prob + right_prob) / 2
             affected = "left" if left_diabetic else "right"
             affected_prob = left_prob if left_diabetic else right_prob
-            results["combined_prediction"] = "Control"
-            results["combined_confidence"] = round(
-                100.0 - (left_prob + right_prob) / 2, 2
-            )
-            results["diagnosis_factors"].append(
-                f"The {affected} foot shows some diabetic indicators "
-                f"({affected_prob:.1f}% probability) — further evaluation recommended"
-            )
+            # If average diabetic probability across both feet >= 40%, treat as Diabetic
+            # This catches cases like 48% + 33% = 40.5% avg which is clinically concerning
+            if avg_prob >= 40.0:
+                results["combined_prediction"] = "Diabetic"
+                results["combined_confidence"] = round(avg_prob, 2)
+                results["diagnosis_factors"].append(
+                    f"Combined diabetic probability ({avg_prob:.1f}%) indicates diabetic signs "
+                    f"— left: {left_prob:.1f}%, right: {right_prob:.1f}%"
+                )
+            else:
+                results["combined_prediction"] = "Control"
+                results["combined_confidence"] = round(100.0 - avg_prob, 2)
+                results["diagnosis_factors"].append(
+                    f"The {affected} foot shows some diabetic indicators "
+                    f"({affected_prob:.1f}% probability) — further evaluation recommended"
+                )
         else:
             results["combined_prediction"] = "Control"
             results["combined_confidence"] = round(100.0 - (left_prob + right_prob) / 2, 2)
