@@ -8,6 +8,8 @@ Guidelines for working with this codebase.
 
 AI system for detecting **Diabetic Peripheral Neuropathy (DPN)** from plantar thermogram images of boot feet. Uses YOLOv11 (primary) and sklearn (CSV temperature data). Dataset: 45 Control + 122 Diabetic subjects, each with left and right foot PNG + CSV.
 
+**Current best model:** `checkpoints/best_yolo_model.pt` — `yolo11l-cls`, trained on Google Colab T4 GPU, 100 epochs, batch=32. Achieved **97.5% top-1 accuracy** on validation set.
+
 ---
 
 ## Architecture
@@ -42,34 +44,73 @@ checkpoints/            Saved model weights (git-ignored)
 - Delete `checkpoints/yolo_dataset/` before rerunning to get a fresh oversampled build.
 
 ### Model variant
-- Default: `yolo11m-cls` (medium). Change via `YOLOv11DPNClassifier(variant='yolo11s-cls')` for faster training on CPU.
+- Currently trained: `yolo11l-cls` (large) — 97.5% accuracy, trained on Colab GPU.
+- Default code default: `yolo11m-cls` (medium). Change via `YOLOv11DPNClassifier(variant='yolo11l-cls')`.
+- For faster CPU training use `yolo11s-cls`.
+
+### Model file storage
+- `checkpoints/best_yolo_model.pt` is git-ignored (too large for GitHub).
+- Trained model is stored in Google Drive under `DPN_Checkpoints/best_yolo_model.pt`.
+- To retrain: use `notebooks/train_model_colab.ipynb` on Google Colab for GPU speed.
 
 ---
 
 ## Training
 
-```bash
+### Recommended: Google Colab (GPU, ~15 min)
+1. Open `notebooks/train_model_colab.ipynb` in Colab
+2. Runtime → Change runtime type → T4 GPU → Save
+3. Runtime → Run all
+4. Download `best_yolo_model.pt` → place in `checkpoints/`
+
+### Local training (CPU, ~3 hrs)
+```powershell
 # 1. Rebuild dataset (required if you changed data_loader.py)
-rmdir /s /q checkpoints\yolo_dataset
+Remove-Item -Recurse -Force checkpoints\yolo_dataset
 
 # 2. Run notebook
 jupyter notebook notebooks/train_model.ipynb
+```
 
-# 3. Or train from Python directly
+Or train from Python directly:
+```python
 from models.data_loader import prepare_yolo_dataset
 from models.model import YOLOv11DPNClassifier
 from models.trainer import YOLOTrainer
 
 yaml_path = prepare_yolo_dataset("data/", "checkpoints/yolo_dataset")
-model = YOLOv11DPNClassifier(variant='yolo11m-cls')
+model = YOLOv11DPNClassifier(variant='yolo11l-cls')
 trainer = YOLOTrainer(model, save_dir="checkpoints")
-trainer.train(yaml_path, epochs=100, imgsz=224, batch=16, patience=15)
+trainer.train(yaml_path, epochs=100, imgsz=224, batch=16, patience=20)
 trainer.save_best_checkpoint()
 ```
 
 Expected output files after training:
 - `checkpoints/best_yolo_model.pt` — primary model used by API
 - `checkpoints/yolo11_dpn/weights/best.pt` — Ultralytics run output
+
+---
+
+## Mobile App Connection
+
+The mobile app connects to the FastAPI server via HTTP. The main endpoint is:
+```
+POST /predict/patient/images  — accepts left_foot + right_foot PNG files
+```
+
+For local testing (same WiFi):
+```
+http://<PC_LOCAL_IP>:8000/predict/patient/images
+```
+
+For production (deployed): a permanent server URL is needed (Railway/Render).
+The API is **not yet deployed** — currently runs locally only.
+
+Key response fields the app should use:
+- `is_diabetic` — boolean, main result
+- `combined_prediction` — "Diabetic" or "Control"
+- `combined_confidence` — float, percentage
+- `diagnosis_factors` — array of strings, explanation
 
 ---
 

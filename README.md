@@ -17,24 +17,38 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
 
 ---
 
+## Model Performance
+
+| Model | Accuracy | Variant | Trained on |
+|-------|----------|---------|-----------|
+| **YOLOv11** | **97.5%** | `yolo11l-cls` | Google Colab T4 GPU, 100 epochs |
+| CNN (legacy) | 88.68% | LightweightCNN | CPU |
+| SVM | 84.91% | RBF kernel | CPU |
+
+> Current best model: `checkpoints/best_yolo_model.pt` — YOLOv11 large, trained with oversampling and augmentation.
+
+---
+
 ## AI Models Used
 
 ### 1. YOLOv11 Classification (Primary — Recommended)
 - **Framework**: [Ultralytics](https://github.com/ultralytics/ultralytics) YOLOv11
-- **Mode**: Image classification (`yolo11m-cls` default variant)
-- **Why**: Higher accuracy than the custom CNN, especially at lower sample sizes, due to pre-trained ImageNet weights and YOLO's advanced augmentation and training pipeline. Addresses accuracy instability seen in early CNN training epochs.
+- **Variant used**: `yolo11l-cls` (large)
+- **Accuracy**: **97.5% top-1** on validation set
+- **Trained on**: Google Colab T4 GPU, 100 epochs, batch=32, imgsz=224
+- **Why**: Higher accuracy than the custom CNN due to pre-trained ImageNet weights, advanced augmentation pipeline, and cosine LR scheduling. Oversampling applied to fix class imbalance (45 Control vs 122 Diabetic).
 - **Input**: RGB thermal images (PNG/JPG) — auto-resized to 224×224
 - **Output**: Binary classification (Control vs Diabetic) with confidence percentage
-- **Saved checkpoint**: `checkpoints/best_yolo_model.pt`
+- **Saved checkpoint**: `checkpoints/best_yolo_model.pt` (git-ignored, stored separately)
 
 **Available size variants** (tradeoff: speed vs accuracy):
 
 | Variant | Key | Notes |
 |---------|-----|-------|
 | `yolo11n-cls` | `yolo11n` | Nano — fastest |
-| `yolo11s-cls` | `yolo11s` / `yolo11` | Small — fastest on CPU |
-| `yolo11m-cls` | `yolo11m` | Medium — **default, best balance** |
-| `yolo11l-cls` | `yolo11l` | Large |
+| `yolo11s-cls` | `yolo11s` | Small — fastest on CPU |
+| `yolo11m-cls` | `yolo11m` | Medium — default |
+| `yolo11l-cls` | `yolo11l` | Large — **currently trained, best accuracy** |
 | `yolo11x-cls` | `yolo11x` | Extra-large — most accurate |
 
 ### 2. CNN (Legacy — Thermal Images)
@@ -101,24 +115,28 @@ pip install ultralytics>=8.3.0
 
 ### Step 2: Train the YOLOv11 Model (Recommended)
 
+**Option A — Google Colab (recommended, ~15 min on free GPU):**
+
+Open `notebooks/train_model_colab.ipynb` in [Google Colab](https://colab.research.google.com):
+- Runtime → Change runtime type → T4 GPU → Save
+- Runtime → Run all
+- Download `best_yolo_model.pt` when done and place in `checkpoints/`
+
+**Option B — Local training (~3 hrs on CPU):**
+
 ```python
 from models.data_loader import prepare_yolo_dataset
 from models.model import YOLOv11DPNClassifier
 from models.trainer import YOLOTrainer
 
-# Prepare dataset in YOLO classification format
 yaml_path = prepare_yolo_dataset("data/", "checkpoints/yolo_dataset")
-
-# Create and train the model (downloads pre-trained weights automatically)
-model = YOLOv11DPNClassifier(variant='yolo11s-cls')
+model = YOLOv11DPNClassifier(variant='yolo11l-cls')
 trainer = YOLOTrainer(model, save_dir="checkpoints")
-trainer.train(yaml_path, epochs=50, imgsz=224, batch=16, patience=10)
-
-# Copy best weights to standard path
+trainer.train(yaml_path, epochs=100, imgsz=224, batch=16, patience=20)
 trainer.save_best_checkpoint()  # → checkpoints/best_yolo_model.pt
 ```
 
-Or open and run the training notebook:
+Or run the local notebook:
 ```bash
 jupyter notebook notebooks/train_model.ipynb
 ```
@@ -242,7 +260,34 @@ response = requests.post(url, files=files)
 print(response.json())
 ```
 
-### Option 5: Check API Health
+### Option 5: Test from mobile app / same WiFi
+
+Find your PC's local IP:
+```powershell
+ipconfig
+# Look for IPv4 Address e.g. 192.168.1.5
+```
+
+From your phone browser (same WiFi): `http://192.168.1.5:8000/docs`
+
+From your mobile app code (React Native):
+```javascript
+const formData = new FormData()
+formData.append('left_foot', { uri: leftFootUri, type: 'image/png', name: 'left.png' })
+formData.append('right_foot', { uri: rightFootUri, type: 'image/png', name: 'right.png' })
+
+const response = await fetch('http://192.168.1.5:8000/predict/patient/images', {
+    method: 'POST',
+    body: formData,
+})
+const result = await response.json()
+// result.is_diabetic      → true/false
+// result.combined_prediction → "Diabetic" or "Control"
+// result.combined_confidence → confidence percentage
+// result.diagnosis_factors   → explanation array
+```
+
+### Option 6: Check API Health
 
 ```bash
 curl http://localhost:8000/health
@@ -252,8 +297,9 @@ Returns:
 ```json
 {
   "status": "healthy",
-  "cnn_model_loaded": true,
-  "sklearn_model_loaded": true
+  "image_model_loaded": true,
+  "image_model_type": "YOLO",
+  "sklearn_model_loaded": false
 }
 ```
 
