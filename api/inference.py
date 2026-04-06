@@ -313,51 +313,70 @@ def calculate_asymmetry(
 def fuse_foot_predictions(
     yolo_result: Dict,
     sklearn_result: Dict,
+    fusion_model=None,
     yolo_weight: float = 0.6
 ) -> Dict:
     """
     Fuse per-foot predictions from YOLOv11 (image) and sklearn (CSV temperature).
 
-    Weighted average: YOLO gets 60% weight (97.5% accuracy on this dataset)
-    and sklearn gets 40% weight as the secondary temperature-signal model.
-    Both probabilities are in percent [0–100].
+    Two modes:
+      1. Meta-classifier (preferred): a LogisticRegression trained on the two
+         Diabetic probabilities learns the optimal combination from data.
+         Loaded from checkpoints/best_fusion_model.joblib at startup.
+      2. Fixed weighted average (fallback): YOLO 60%, sklearn 40%.
+         Used when the fusion model is not available.
+
+    Both probability values are in percent [0–100].
     """
-    sklearn_weight = 1.0 - yolo_weight
-
-    yolo_diabetic = yolo_result.get("probabilities", {}).get("Diabetic", 0.0)
-    yolo_control  = yolo_result.get("probabilities", {}).get("Control",  0.0)
-
+    yolo_diabetic    = yolo_result.get("probabilities", {}).get("Diabetic", 0.0)
+    yolo_control     = yolo_result.get("probabilities", {}).get("Control",  0.0)
     sklearn_diabetic = sklearn_result.get("probabilities", {}).get("Diabetic", 0.0)
     sklearn_control  = sklearn_result.get("probabilities", {}).get("Control",  0.0)
 
-    fused_diabetic = yolo_weight * yolo_diabetic + sklearn_weight * sklearn_diabetic
-    fused_control  = yolo_weight * yolo_control  + sklearn_weight * sklearn_control
+    # ── Mode 1: trained meta-classifier ───────────────────────────────────────
+    if fusion_model is not None:
+        try:
+            # Input: [yolo_dm_prob, sklearn_dm_prob] in 0-1 scale
+            X_meta = np.array([[yolo_diabetic / 100.0, sklearn_diabetic / 100.0]])
+            meta_proba     = fusion_model.predict_proba(X_meta)[0]  # [control, diabetic]
+            fused_control  = round(float(meta_proba[0]) * 100, 2)
+            fused_diabetic = round(float(meta_proba[1]) * 100, 2)
+            is_diabetic    = fused_diabetic >= fused_control
+            fusion_method  = "meta_classifier(logistic_regression)"
+        except Exception:
+            # If meta-model errors for any reason, fall through to weighted avg
+            fusion_model = None
 
-    # Normalise (each source already sums to 100, so this is a safety guard)
-    total = fused_diabetic + fused_control
-    if total > 0:
-        fused_diabetic = fused_diabetic / total * 100
-        fused_control  = fused_control  / total * 100
-
-    is_diabetic = fused_diabetic >= fused_control
-    prediction  = "Diabetic" if is_diabetic else "Control"
+    # ── Mode 2: fixed weighted average (fallback) ──────────────────────────────
+    if fusion_model is None:
+        sklearn_weight = 1.0 - yolo_weight
+        fused_diabetic = yolo_weight * yolo_diabetic + sklearn_weight * sklearn_diabetic
+        fused_control  = yolo_weight * yolo_control  + sklearn_weight * sklearn_control
+        total = fused_diabetic + fused_control
+        if total > 0:
+            fused_diabetic = fused_diabetic / total * 100
+            fused_control  = fused_control  / total * 100
+        fused_diabetic = round(fused_diabetic, 2)
+        fused_control  = round(fused_control,  2)
+        is_diabetic    = fused_diabetic >= fused_control
+        fusion_method  = (
+            f"weighted_average(yolo={yolo_weight:.0%}, "
+            f"sklearn={1.0 - yolo_weight:.0%})"
+        )
 
     return {
-        "prediction":           prediction,
-        "class_index":          1 if is_diabetic else 0,
-        "confidence":           round(max(fused_diabetic, fused_control), 2),
-        "is_diabetic":          is_diabetic,
+        "prediction":            "Diabetic" if is_diabetic else "Control",
+        "class_index":           1 if is_diabetic else 0,
+        "confidence":            max(fused_diabetic, fused_control),
+        "is_diabetic":           is_diabetic,
         "probabilities": {
-            "Control":  round(fused_control,  2),
-            "Diabetic": round(fused_diabetic, 2),
+            "Control":  fused_control,
+            "Diabetic": fused_diabetic,
         },
         "yolo_probabilities":    yolo_result.get("probabilities", {}),
         "sklearn_probabilities": sklearn_result.get("probabilities", {}),
-        "fusion_method": (
-            f"weighted_average(yolo={yolo_weight:.0%}, "
-            f"sklearn={sklearn_weight:.0%})"
-        ),
-        "input_type": "image+csv",
+        "fusion_method":         fusion_method,
+        "input_type":            "image+csv",
     }
 
 
@@ -369,7 +388,8 @@ def predict_patient(
     left_csv: Optional[Union[str, Path]] = None,
     right_csv: Optional[Union[str, Path]] = None,
     left_temps: Optional[np.ndarray] = None,
-    right_temps: Optional[np.ndarray] = None
+    right_temps: Optional[np.ndarray] = None,
+    fusion_model=None,
 ) -> Dict:
     """
     Make a combined prediction for a patient using both feet.
@@ -429,7 +449,7 @@ def predict_patient(
 
         # --- Fusion ---
         if yolo_res is not None and sklearn_res is not None:
-            return fuse_foot_predictions(yolo_res, sklearn_res)
+            return fuse_foot_predictions(yolo_res, sklearn_res, fusion_model=fusion_model)
         if yolo_res is not None:
             return yolo_res
         if sklearn_res is not None:

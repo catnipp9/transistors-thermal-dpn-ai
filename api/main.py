@@ -90,6 +90,7 @@ class HealthResponse(BaseModel):
     image_model_loaded: bool
     image_model_type: str
     sklearn_model_loaded: bool
+    fusion_model_loaded: bool
 
 
 class ErrorResponse(BaseModel):
@@ -192,6 +193,7 @@ class PatientPredictionResponse(BaseModel):
 # image_classifier holds whichever image model is available: YOLOv11 (preferred) or CNN (fallback)
 image_classifier: Optional[DPNClassifier] = None
 sklearn_classifier: Optional[DPNClassifier] = None
+fusion_model = None  # LogisticRegression meta-classifier (checkpoints/best_fusion_model.joblib)
 
 # Keep a reference to the legacy name so predict_patient() calls still work
 cnn_classifier: Optional[DPNClassifier] = None
@@ -201,8 +203,8 @@ cnn_classifier: Optional[DPNClassifier] = None
 
 @app.on_event("startup")
 async def load_models():
-    """Load image model (YOLOv11 preferred, CNN fallback) and sklearn model on startup."""
-    global image_classifier, sklearn_classifier, cnn_classifier
+    """Load image model (YOLOv11 preferred, CNN fallback), sklearn model, and fusion meta-classifier on startup."""
+    global image_classifier, sklearn_classifier, cnn_classifier, fusion_model
 
     checkpoints_dir = Path(__file__).parent.parent / "checkpoints"
 
@@ -259,6 +261,19 @@ async def load_models():
     else:
         print(f"Warning: sklearn model not found at {sklearn_path}")
 
+    # --- Fusion meta-classifier (optional but recommended for FLIR Lepton deployment) ---
+    fusion_path = checkpoints_dir / "best_fusion_model.joblib"
+    if fusion_path.exists():
+        try:
+            import joblib as _joblib
+            fusion_model = _joblib.load(fusion_path)
+            print(f"Fusion meta-classifier loaded from {fusion_path}")
+        except Exception as e:
+            print(f"Warning: could not load fusion model: {e}")
+    else:
+        print(f"Info: No fusion model at {fusion_path} — using fixed 60/40 weights.")
+        print("      Run python train_fusion.py to train it.")
+
     if image_classifier is None and sklearn_classifier is None:
         print("WARNING: No models loaded! Run the training notebook first.")
 
@@ -284,7 +299,8 @@ async def health_check():
         status="healthy",
         image_model_loaded=image_classifier is not None,
         image_model_type=model_type,
-        sklearn_model_loaded=sklearn_classifier is not None
+        sklearn_model_loaded=sklearn_classifier is not None,
+        fusion_model_loaded=fusion_model is not None,
     )
 
 
@@ -586,7 +602,8 @@ async def predict_patient_images(
             cnn_classifier=image_classifier,
             sklearn_classifier=sklearn_classifier,
             left_image=left_image,
-            right_image=right_image
+            right_image=right_image,
+            fusion_model=fusion_model,
         )
 
         return PatientPredictionResponse(
@@ -670,7 +687,8 @@ async def predict_patient_csv(
             left_csv=left_temp_path,
             right_csv=right_temp_path,
             left_temps=left_data,
-            right_temps=right_data
+            right_temps=right_data,
+            fusion_model=fusion_model,
         )
 
         # Cleanup temp files
@@ -764,7 +782,8 @@ async def predict_patient_temperature(
             left_csv=left_temp_path,
             right_csv=right_temp_path,
             left_temps=left_temps,
-            right_temps=right_temps
+            right_temps=right_temps,
+            fusion_model=fusion_model,
         )
 
         # Cleanup temp files
