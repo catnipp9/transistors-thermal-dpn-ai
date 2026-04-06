@@ -23,9 +23,17 @@ nul
 Thumbs.db
 .DS_Store
 
-# Model checkpoints (large files)
+# Model checkpoints — large training artifacts ignored, production models committed
 checkpoints/*.pth
-checkpoints/*.joblib
+checkpoints/yolo_dataset/
+checkpoints/*.png
+checkpoints/*.json
+checkpoints/*.csv
+
+# These three model files ARE committed so Railway can build without extra steps:
+# checkpoints/best_yolo_model.pt      (~25MB)
+# checkpoints/best_sklearn_model.joblib
+# checkpoints/best_fusion_model.joblib
 
 # Data (large files - track separately or use git-lfs)
 # data/

@@ -3,6 +3,7 @@ FastAPI Application for DPN Classification
 Provides REST API endpoints for thermogram-based diabetic neuropathy detection
 """
 
+import base64
 import io
 import sys
 from pathlib import Path
@@ -893,6 +894,141 @@ async def predict_patient_combined(
             right_csv=right_csv_path,
             left_temps=left_temps,
             right_temps=right_temps,
+        )
+
+        Path(left_csv_path).unlink(missing_ok=True)
+        Path(right_csv_path).unlink(missing_ok=True)
+
+        def _foot_result(foot_data):
+            if foot_data is None:
+                return None
+            allowed = {
+                "prediction", "confidence", "is_diabetic", "probabilities",
+                "yolo_probabilities", "sklearn_probabilities", "fusion_method",
+            }
+            return FootResult(**{k: v for k, v in foot_data.items() if k in allowed})
+
+        return PatientPredictionResponse(
+            success=True,
+            combined_prediction=result["combined_prediction"],
+            combined_confidence=result["combined_confidence"],
+            is_diabetic=result["is_diabetic"],
+            left_foot=_foot_result(result["left_foot"]),
+            right_foot=_foot_result(result["right_foot"]),
+            asymmetry=AsymmetryResult(**result["asymmetry"]) if result["asymmetry"] else None,
+            diagnosis_factors=result["diagnosis_factors"],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+
+# ==================== Mobile / FLIR Lepton Endpoint ====================
+
+class MobilePatientInput(BaseModel):
+    """
+    JSON input for the FLIR Lepton 3.5 mobile app.
+
+    The camera SDK gives you raw pixel bytes (image) and a temperature matrix.
+    Encode the rendered thermal image as base64 PNG, and send the temperature
+    matrix as a 2-D array of floats.  Both fields are required for full
+    dual-modality fusion (YOLO + sklearn + meta-classifier).
+
+    Fields
+    ------
+    left_image_b64   : base64-encoded PNG of the left foot thermal image
+    right_image_b64  : base64-encoded PNG of the right foot thermal image
+    left_temperatures: 2-D array of temperature values for the left foot
+    right_temperatures: 2-D array of temperature values for the right foot
+    """
+    left_image_b64: str = Field(..., description="Base64-encoded PNG of left foot thermal image")
+    right_image_b64: str = Field(..., description="Base64-encoded PNG of right foot thermal image")
+    left_temperatures: List[List[float]] = Field(..., description="2-D temperature matrix for left foot (e.g. 120x160)")
+    right_temperatures: List[List[float]] = Field(..., description="2-D temperature matrix for right foot")
+
+
+@app.post(
+    "/predict/patient/mobile",
+    response_model=PatientPredictionResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid input"},
+        500: {"model": ErrorResponse, "description": "Server error"},
+        503: {"model": ErrorResponse, "description": "Model not loaded"},
+    },
+    tags=["Patient Diagnosis"],
+    summary="FLIR Lepton 3.5 — combined image + temperature (JSON)",
+)
+async def predict_patient_mobile(data: MobilePatientInput):
+    """
+    Recommended endpoint for the FLIR Lepton 3.5 mobile app.
+
+    Accepts a single JSON body containing:
+    - Base64-encoded thermal images for both feet
+    - Raw temperature matrices for both feet
+
+    Runs full dual-modality fusion:
+      YOLOv11 (image) + sklearn SVM (temperature) → meta-classifier → final verdict
+
+    **How to call from the mobile app:**
+    ```json
+    POST /predict/patient/mobile
+    Content-Type: application/json
+
+    {
+      "left_image_b64": "<base64 PNG>",
+      "right_image_b64": "<base64 PNG>",
+      "left_temperatures": [[28.5, 28.6, ...], ...],
+      "right_temperatures": [[28.3, 28.4, ...], ...]
+    }
+    ```
+    """
+    if image_classifier is None:
+        raise HTTPException(status_code=503, detail="Image model not loaded.")
+    if sklearn_classifier is None:
+        raise HTTPException(status_code=503, detail="sklearn model not loaded.")
+
+    try:
+        import tempfile
+
+        # Decode base64 images
+        try:
+            left_img_bytes  = base64.b64decode(data.left_image_b64)
+            right_img_bytes = base64.b64decode(data.right_image_b64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid base64 image data.")
+
+        left_img  = Image.open(io.BytesIO(left_img_bytes)).convert("RGB")
+        right_img = Image.open(io.BytesIO(right_img_bytes)).convert("RGB")
+
+        # Temperature matrices
+        left_temps  = np.array(data.left_temperatures,  dtype=np.float32)
+        right_temps = np.array(data.right_temperatures, dtype=np.float32)
+
+        for arr, name in [(left_temps, "left"), (right_temps, "right")]:
+            if arr.ndim != 2:
+                raise HTTPException(status_code=400, detail=f"{name}_temperatures must be a 2-D array.")
+
+        # Write temps to temp CSV files (sklearn classifier reads from file path)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            pd.DataFrame(left_temps).to_csv(f.name, header=False, index=False)
+            left_csv_path = f.name
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            pd.DataFrame(right_temps).to_csv(f.name, header=False, index=False)
+            right_csv_path = f.name
+
+        result = predict_patient(
+            cnn_classifier=image_classifier,
+            sklearn_classifier=sklearn_classifier,
+            left_image=left_img,
+            right_image=right_img,
+            left_csv=left_csv_path,
+            right_csv=right_csv_path,
+            left_temps=left_temps,
+            right_temps=right_temps,
+            fusion_model=fusion_model,
         )
 
         Path(left_csv_path).unlink(missing_ok=True)

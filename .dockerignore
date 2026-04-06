@@ -1,0 +1,12 @@
+venv/
+data/
+notebooks/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+*.ipynb_checkpoints
+checkpoints/yolo_dataset/
+checkpoints/*.png
+checkpoints/*.json
+checkpoints/*.csv
