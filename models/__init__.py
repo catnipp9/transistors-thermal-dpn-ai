@@ -2,13 +2,6 @@
 DPN Classification Models Package
 """
 
-from .data_loader import (
-    ThermogramDataset,
-    create_data_loaders,
-    load_data_for_sklearn,
-    get_transforms
-)
-
 from .preprocessing import (
     normalize_temperature,
     extract_statistical_features,
@@ -32,21 +25,26 @@ from .model import (
     get_model
 )
 
-from .trainer import (
-    CNNTrainer,
-    SklearnTrainer,
-    EarlyStopping,
-    cross_validate_sklearn,
-    print_metrics
-)
+# data_loader and trainer are only needed for training, not inference.
+# Import them lazily to avoid pulling in torch/tqdm at API startup.
+try:
+    from .data_loader import (
+        ThermogramDataset,
+        create_data_loaders,
+        load_data_for_sklearn,
+        get_transforms
+    )
+    from .trainer import (
+        CNNTrainer,
+        SklearnTrainer,
+        EarlyStopping,
+        cross_validate_sklearn,
+        print_metrics
+    )
+except ImportError:
+    pass
 
 __all__ = [
-    # Data loading
-    'ThermogramDataset',
-    'create_data_loaders',
-    'load_data_for_sklearn',
-    'get_transforms',
-
     # Preprocessing
     'normalize_temperature',
     'extract_statistical_features',
@@ -67,11 +65,4 @@ __all__ = [
     'create_mlp',
     'create_logistic_regression',
     'get_model',
-
-    # Training
-    'CNNTrainer',
-    'SklearnTrainer',
-    'EarlyStopping',
-    'cross_validate_sklearn',
-    'print_metrics'
 ]
