@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.model import get_model, YOLOv11DPNClassifier
 from models.data_loader import get_transforms
+from models.preprocessing import extract_thermal_features, extract_foot_roi
 
 
 class DPNClassifier:
@@ -116,24 +117,30 @@ class DPNClassifier:
         """
         Preprocess a CSV temperature matrix for sklearn inference.
 
+        Uses extract_thermal_features() — the same feature engineering applied
+        during training — rather than raw flattening. This gives 54 angiosome-
+        aligned features (MPA/LPA/MCA/LCA + global stats + gradients + hot/cold
+        spots) instead of 10,920 raw values, matching what the saved model was
+        trained on.
+
         Args:
             csv_path: Path to CSV file
             target_shape: Target shape for resizing
 
         Returns:
-            Flattened feature vector
+            Feature vector shaped (1, 54)
         """
         import pandas as pd
         from scipy.ndimage import zoom
 
         data = pd.read_csv(csv_path, header=None).values.astype(np.float32)
 
-        # Resize if needed
         if data.shape != target_shape:
             zoom_factors = (target_shape[0] / data.shape[0], target_shape[1] / data.shape[1])
             data = zoom(data, zoom_factors, order=1)
 
-        return data.flatten().reshape(1, -1)
+        features = extract_thermal_features(data)
+        return features.reshape(1, -1)
 
     def predict(
         self,
@@ -159,7 +166,21 @@ class DPNClassifier:
             return self._predict_sklearn(input_data, return_proba)
 
     def _predict_yolo(self, image: Union[str, Path, Image.Image, np.ndarray], return_proba: bool) -> Dict:
-        """Make prediction using YOLOv11 classification model."""
+        """Make prediction using YOLOv11 classification model.
+
+        Applies ROI crop before inference so the model always receives a
+        tightly-framed foot image, regardless of source camera resolution
+        (e.g. 160×120 vs the training data's 168×65 aspect ratio).
+        """
+        # Load to PIL if needed
+        if isinstance(image, (str, Path)):
+            image = Image.open(image).convert("RGB")
+        elif isinstance(image, np.ndarray):
+            image = Image.fromarray(image.astype("uint8")).convert("RGB")
+
+        # Crop to foot ROI — neutralises aspect-ratio mismatch from different cameras
+        image = extract_foot_roi(image)
+
         result = self.model.predict(image)
 
         if not return_proba:
@@ -289,6 +310,57 @@ def calculate_asymmetry(
     }
 
 
+def fuse_foot_predictions(
+    yolo_result: Dict,
+    sklearn_result: Dict,
+    yolo_weight: float = 0.6
+) -> Dict:
+    """
+    Fuse per-foot predictions from YOLOv11 (image) and sklearn (CSV temperature).
+
+    Weighted average: YOLO gets 60% weight (97.5% accuracy on this dataset)
+    and sklearn gets 40% weight as the secondary temperature-signal model.
+    Both probabilities are in percent [0–100].
+    """
+    sklearn_weight = 1.0 - yolo_weight
+
+    yolo_diabetic = yolo_result.get("probabilities", {}).get("Diabetic", 0.0)
+    yolo_control  = yolo_result.get("probabilities", {}).get("Control",  0.0)
+
+    sklearn_diabetic = sklearn_result.get("probabilities", {}).get("Diabetic", 0.0)
+    sklearn_control  = sklearn_result.get("probabilities", {}).get("Control",  0.0)
+
+    fused_diabetic = yolo_weight * yolo_diabetic + sklearn_weight * sklearn_diabetic
+    fused_control  = yolo_weight * yolo_control  + sklearn_weight * sklearn_control
+
+    # Normalise (each source already sums to 100, so this is a safety guard)
+    total = fused_diabetic + fused_control
+    if total > 0:
+        fused_diabetic = fused_diabetic / total * 100
+        fused_control  = fused_control  / total * 100
+
+    is_diabetic = fused_diabetic >= fused_control
+    prediction  = "Diabetic" if is_diabetic else "Control"
+
+    return {
+        "prediction":           prediction,
+        "class_index":          1 if is_diabetic else 0,
+        "confidence":           round(max(fused_diabetic, fused_control), 2),
+        "is_diabetic":          is_diabetic,
+        "probabilities": {
+            "Control":  round(fused_control,  2),
+            "Diabetic": round(fused_diabetic, 2),
+        },
+        "yolo_probabilities":    yolo_result.get("probabilities", {}),
+        "sklearn_probabilities": sklearn_result.get("probabilities", {}),
+        "fusion_method": (
+            f"weighted_average(yolo={yolo_weight:.0%}, "
+            f"sklearn={sklearn_weight:.0%})"
+        ),
+        "input_type": "image+csv",
+    }
+
+
 def predict_patient(
     cnn_classifier: Optional[DPNClassifier],
     sklearn_classifier: Optional[DPNClassifier],
@@ -332,49 +404,51 @@ def predict_patient(
         "diagnosis_factors": []
     }
 
-    # Predict left foot
-    if left_image is not None and cnn_classifier is not None:
-        results["left_foot"] = cnn_classifier.predict(left_image, return_proba=True)
-        results["left_foot"]["input_type"] = "image"
-    elif left_csv is not None and sklearn_classifier is not None:
-        results["left_foot"] = sklearn_classifier.predict(left_csv, return_proba=True)
-        results["left_foot"]["input_type"] = "csv"
-        # Load temps for asymmetry calculation
-        if left_temps is None:
-            left_temps = pd.read_csv(left_csv, header=None).values.astype(np.float32)
-    elif left_temps is not None and sklearn_classifier is not None:
-        # Save temp array to temporary CSV for prediction
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
-            pd.DataFrame(left_temps).to_csv(f.name, header=False, index=False)
-            results["left_foot"] = sklearn_classifier.predict(f.name, return_proba=True)
-            results["left_foot"]["input_type"] = "temperature_array"
-            Path(f.name).unlink(missing_ok=True)
+    import tempfile
 
-    # Predict right foot
-    if right_image is not None and cnn_classifier is not None:
-        results["right_foot"] = cnn_classifier.predict(right_image, return_proba=True)
-        results["right_foot"]["input_type"] = "image"
-    elif right_csv is not None and sklearn_classifier is not None:
-        results["right_foot"] = sklearn_classifier.predict(right_csv, return_proba=True)
-        results["right_foot"]["input_type"] = "csv"
-        # Load temps for asymmetry calculation
-        if right_temps is None:
-            right_temps = pd.read_csv(right_csv, header=None).values.astype(np.float32)
-    elif right_temps is not None and sklearn_classifier is not None:
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
-            pd.DataFrame(right_temps).to_csv(f.name, header=False, index=False)
-            results["right_foot"] = sklearn_classifier.predict(f.name, return_proba=True)
-            results["right_foot"]["input_type"] = "temperature_array"
-            Path(f.name).unlink(missing_ok=True)
+    def _predict_foot(image, csv_path, temps):
+        """Run all available classifiers for one foot and fuse when both present."""
+        yolo_res    = None
+        sklearn_res = None
 
-    # Calculate asymmetry if we have temperature data for both feet
-    if left_temps is not None and right_temps is not None:
-        results["asymmetry"] = calculate_asymmetry(left_temps, right_temps)
-    elif left_csv is not None and right_csv is not None:
+        # --- Image branch (YOLOv11) ---
+        if image is not None and cnn_classifier is not None:
+            yolo_res = cnn_classifier.predict(image, return_proba=True)
+            yolo_res["input_type"] = "image"
+
+        # --- Temperature branch (sklearn) ---
+        if csv_path is not None and sklearn_classifier is not None:
+            sklearn_res = sklearn_classifier.predict(csv_path, return_proba=True)
+            sklearn_res["input_type"] = "csv"
+        elif temps is not None and sklearn_classifier is not None:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+                pd.DataFrame(temps).to_csv(f.name, header=False, index=False)
+                sklearn_res = sklearn_classifier.predict(f.name, return_proba=True)
+                sklearn_res["input_type"] = "temperature_array"
+                Path(f.name).unlink(missing_ok=True)
+
+        # --- Fusion ---
+        if yolo_res is not None and sklearn_res is not None:
+            return fuse_foot_predictions(yolo_res, sklearn_res)
+        if yolo_res is not None:
+            return yolo_res
+        if sklearn_res is not None:
+            return sklearn_res
+        return None
+
+    # Load left temps from CSV if not already provided (needed for asymmetry)
+    if left_temps is None and left_csv is not None:
         left_temps = pd.read_csv(left_csv, header=None).values.astype(np.float32)
+
+    # Load right temps from CSV if not already provided
+    if right_temps is None and right_csv is not None:
         right_temps = pd.read_csv(right_csv, header=None).values.astype(np.float32)
+
+    results["left_foot"]  = _predict_foot(left_image,  left_csv,  left_temps)
+    results["right_foot"] = _predict_foot(right_image, right_csv, right_temps)
+
+    # Calculate asymmetry when temperature matrices are available for both feet
+    if left_temps is not None and right_temps is not None:
         results["asymmetry"] = calculate_asymmetry(left_temps, right_temps)
 
     # Combined diagnosis logic
@@ -460,11 +534,11 @@ def predict_patient(
 
     elif left_diabetic is not None:
         results["combined_prediction"] = results["left_foot"]["prediction"]
-        results["combined_confidence"] = left_conf
+        results["combined_confidence"] = round(left_prob, 2)
         results["diagnosis_factors"].append("Only left foot analyzed")
     elif right_diabetic is not None:
         results["combined_prediction"] = results["right_foot"]["prediction"]
-        results["combined_confidence"] = right_conf
+        results["combined_confidence"] = round(right_prob, 2)
         results["diagnosis_factors"].append("Only right foot analyzed")
 
     results["is_diabetic"] = results["combined_prediction"] == "Diabetic"

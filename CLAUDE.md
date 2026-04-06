@@ -8,7 +8,9 @@ Guidelines for working with this codebase.
 
 AI system for detecting **Diabetic Peripheral Neuropathy (DPN)** from plantar thermogram images of boot feet. Uses YOLOv11 (primary) and sklearn (CSV temperature data). Dataset: 45 Control + 122 Diabetic subjects, each with left and right foot PNG + CSV.
 
-**Current best model:** `checkpoints/best_yolo_model.pt` — `yolo11l-cls`, trained on Google Colab T4 GPU, 100 epochs, batch=32. Achieved **97.5% top-1 accuracy** on validation set.
+**Current best models:**
+- `checkpoints/best_yolo_model.pt` — `yolo11l-cls`, Colab T4 GPU, 100 epochs, batch=32. **97.5% top-1 accuracy** on thermal images.
+- `checkpoints/best_sklearn_model.joblib` — SVM RBF pipeline (C=100, gamma=0.01), trained on 54 angiosome-aligned features (MPA/LPA/MCA/LCA per Hernandez-Contreras 2019). **89% test accuracy**. Required for the combined `/predict/patient/combined` endpoint.
 
 ---
 
@@ -22,16 +24,31 @@ models/
   trainer.py            YOLOTrainer, CNNTrainer, SklearnTrainer
   preprocessing.py      Feature extraction, normalization, augmentation
 api/
-  main.py               FastAPI endpoints
-  inference.py          DPNClassifier, predict_patient, calculate_asymmetry
+  main.py               FastAPI endpoints (including /predict/patient/combined)
+  inference.py          DPNClassifier, fuse_foot_predictions, predict_patient, calculate_asymmetry
 notebooks/
-  train_model.ipynb     End-to-end training notebook
+  train_model.ipynb       Local end-to-end training (YOLO + sklearn)
+  train_model_colab.ipynb Colab GPU training (YOLO + sklearn)
 checkpoints/            Saved model weights (git-ignored)
 ```
 
 ---
 
 ## Key Design Decisions
+
+### Dual-modality fusion (`api/inference.py → fuse_foot_predictions`)
+- When both a PNG image AND a CSV file are provided for a foot, **both models run independently** and their probabilities are fused via weighted average:
+  - **YOLOv11 weight: 60%** (image classifier — 97.5% accuracy)
+  - **sklearn weight: 40%** (temperature classifier — 89% accuracy)
+- sklearn features use paper-aligned angiosome boundaries (Hernandez-Contreras 2019):
+  - MPA (Medial Plantar Artery) = top 60% rows × inner 35% cols
+  - LPA (Lateral Plantar Artery) = top 60% rows × outer 65% cols  ← top discriminator
+  - MCA (Medial Calcaneal Artery) = bottom 40% rows × inner 35% cols
+  - LCA (Lateral Calcaneal Artery) = bottom 40% rows × outer 65% cols  ← 2nd discriminator
+  - 54 total features: 12 global + 24 angiosome + 6 inter-angiosome diffs + 3 gradient + 6 hot/cold + 3 forefoot/hindfoot
+- Result dict includes `yolo_probabilities`, `sklearn_probabilities`, and `fusion_method` for traceability.
+- Falls back to single-modality automatically when only one input is available.
+- The `_predict_foot` inner function inside `predict_patient` handles this logic.
 
 ### Dual-foot diagnosis logic (`api/inference.py → predict_patient`)
 - **Both feet must independently predict Diabetic** for a positive result.
@@ -49,19 +66,19 @@ checkpoints/            Saved model weights (git-ignored)
 - For faster CPU training use `yolo11s-cls`.
 
 ### Model file storage
-- `checkpoints/best_yolo_model.pt` is git-ignored (too large for GitHub).
-- Trained model is stored in Google Drive under `DPN_Checkpoints/best_yolo_model.pt`.
-- To retrain: use `notebooks/train_model_colab.ipynb` on Google Colab for GPU speed.
+- Both `best_yolo_model.pt` and `best_sklearn_model.joblib` are git-ignored (binary files).
+- After Colab training, both are saved to Google Drive under `DPN_Checkpoints/`.
+- To retrain: use `notebooks/train_model_colab.ipynb` on Google Colab (trains both models).
 
 ---
 
 ## Training
 
-### Recommended: Google Colab (GPU, ~15 min)
+### Recommended: Google Colab (GPU, ~15–20 min)
 1. Open `notebooks/train_model_colab.ipynb` in Colab
 2. Runtime → Change runtime type → T4 GPU → Save
 3. Runtime → Run all
-4. Download `best_yolo_model.pt` → place in `checkpoints/`
+4. Download **both** `best_yolo_model.pt` and `best_sklearn_model.joblib` → place in `checkpoints/`
 
 ### Local training (CPU, ~3 hrs)
 ```powershell
@@ -86,16 +103,21 @@ trainer.save_best_checkpoint()
 ```
 
 Expected output files after training:
-- `checkpoints/best_yolo_model.pt` — primary model used by API
+- `checkpoints/best_yolo_model.pt` — YOLOv11 image model (primary)
+- `checkpoints/best_sklearn_model.joblib` — SVM temperature model (required for combined endpoint)
 - `checkpoints/yolo11_dpn/weights/best.pt` — Ultralytics run output
 
 ---
 
 ## Mobile App Connection
 
-The mobile app connects to the FastAPI server via HTTP. The main endpoint is:
+The mobile app connects to the FastAPI server via HTTP. The recommended endpoint is:
 ```
-POST /predict/patient/images  — accepts left_foot + right_foot PNG files
+POST /predict/patient/combined  — accepts left_foot_image + right_foot_image (PNG) + left_foot_csv + right_foot_csv
+```
+Falls back to images-only if CSV data is unavailable:
+```
+POST /predict/patient/images    — accepts left_foot + right_foot PNG files
 ```
 
 For local testing (same WiFi):
@@ -182,9 +204,11 @@ These are all covered by `.gitignore`.
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `Image model not loaded` | No `best_yolo_model.pt` in checkpoints | Run training notebook first |
-| `Classification datasets must be a directory` | Old bug (fixed) — YAML path passed instead of dir | Already handled in `model.py` |
-| `CUDA not available` | No GPU — training runs on CPU | Normal; training is slower but works |
-| False positives (Control → Diabetic) | Asymmetry threshold too loose or soft threshold | See `predict_patient` logic in `inference.py` |
+| `sklearn model not loaded` | No `best_sklearn_model.joblib` in checkpoints | Run sklearn training cells in Colab or local notebook |
+| 503 on `/predict/patient/combined` | Either model file missing | Both `.pt` and `.joblib` must exist in `checkpoints/` |
+| `Classification datasets must be a directory` | Old bug (fixed) | Already handled in `model.py` |
+| `CUDA not available` | No GPU | Normal — training works on CPU, just slower |
+| False positives (Control → Diabetic) | Asymmetry threshold or soft threshold | See `predict_patient` in `inference.py` |
 | False negatives (Diabetic → Control) | Model underfit or class imbalance | Delete `yolo_dataset/`, retrain with oversampling |
 
 ---

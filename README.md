@@ -19,13 +19,15 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
 
 ## Model Performance
 
-| Model | Accuracy | Variant | Trained on |
-|-------|----------|---------|-----------|
-| **YOLOv11** | **97.5%** | `yolo11l-cls` | Google Colab T4 GPU, 100 epochs |
-| CNN (legacy) | 88.68% | LightweightCNN | CPU |
-| SVM | 84.91% | RBF kernel | CPU |
+| Model | Input | Accuracy | Role |
+|-------|-------|----------|------|
+| **YOLOv11 large** | Thermal image (PNG) | **97.5%** | Primary (60% fusion weight) |
+| SVM RBF | Temperature CSV | **89%** | Secondary (40% fusion weight) |
+| CNN (legacy) | Thermal image (PNG) | 88.68% | Fallback if YOLO unavailable |
 
-> Current best model: `checkpoints/best_yolo_model.pt` — YOLOv11 large, trained with oversampling and augmentation.
+> The combined `/predict/patient/combined` endpoint fuses both models — YOLOv11 reads the image, SVM reads the temperature CSV, and their weighted probabilities determine the final diagnosis.
+>
+> Current best image model: `checkpoints/best_yolo_model.pt` — YOLOv11 large, 100 epochs, Colab T4 GPU.
 
 ---
 
@@ -69,11 +71,19 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
   - Gradient Boosting
   - Multi-Layer Perceptron (MLP)
   - Logistic Regression
-- **Input**: CSV temperature matrices (168×65) flattened into feature vectors
+- **Input**: CSV temperature matrices (168×65) — 54 angiosome-aligned features extracted (MPA/LPA/MCA/LCA regions per Hernandez-Contreras 2019)
 - **Output**: Binary classification (Control vs Diabetic) with confidence percentage
 - **Saved checkpoint**: `checkpoints/best_sklearn_model.joblib`
 
-### 4. Dual-Foot Diagnosis Logic
+### 4. Dual-Modality Fusion (New)
+- When both a thermal image **and** a temperature CSV are provided for a foot, both models run independently and their probabilities are fused:
+  - **YOLOv11 weight: 60%** — image-based, highest accuracy (97.5%)
+  - **sklearn weight: 40%** — temperature-based, secondary signal (89%)
+- The fused probability is used for all downstream diagnosis logic
+- Falls back gracefully to single-modality when only one input type is available
+- Per-foot response includes `yolo_probabilities`, `sklearn_probabilities`, and `fusion_method` for transparency
+
+### 5. Dual-Foot Diagnosis Logic
 - **Both feet must independently predict Diabetic** for a Diabetic result
 - A single diabetic foot is flagged as "further evaluation recommended" — not a positive diagnosis
 - Asymmetry only upgrades a Control result when: mean temp diff >2.2°C **and** the higher-probability foot exceeds 60% Diabetic probability
@@ -113,48 +123,31 @@ pip install torch torchvision
 pip install ultralytics>=8.3.0
 ```
 
-### Step 2: Train the YOLOv11 Model (Recommended)
+### Step 2: Train Both Models
 
-**Option A — Google Colab (recommended, ~15 min on free GPU):**
+Both `best_yolo_model.pt` (images) and `best_sklearn_model.joblib` (temperature CSVs) are required for the combined endpoint. The `/predict/patient/images` endpoint works with YOLO alone.
+
+**Option A — Google Colab (recommended, ~15–20 min on free GPU):**
 
 Open `notebooks/train_model_colab.ipynb` in [Google Colab](https://colab.research.google.com):
 - Runtime → Change runtime type → T4 GPU → Save
 - Runtime → Run all
-- Download `best_yolo_model.pt` when done and place in `checkpoints/`
+- The notebook trains **YOLOv11** (image model) then **SVM** (temperature model)
+- Download both `best_yolo_model.pt` and `best_sklearn_model.joblib` and place them in `checkpoints/`
 
 **Option B — Local training (~3 hrs on CPU):**
 
-```python
-from models.data_loader import prepare_yolo_dataset
-from models.model import YOLOv11DPNClassifier
-from models.trainer import YOLOTrainer
-
-yaml_path = prepare_yolo_dataset("data/", "checkpoints/yolo_dataset")
-model = YOLOv11DPNClassifier(variant='yolo11l-cls')
-trainer = YOLOTrainer(model, save_dir="checkpoints")
-trainer.train(yaml_path, epochs=100, imgsz=224, batch=16, patience=20)
-trainer.save_best_checkpoint()  # → checkpoints/best_yolo_model.pt
-```
-
-Or run the local notebook:
 ```bash
 jupyter notebook notebooks/train_model.ipynb
 ```
 
-Run all cells in order. The notebook will:
-1. Load all thermogram data from the `data/` directory
-2. Prepare the YOLO classification dataset structure
-3. Train the YOLOv11 model on thermal images
-4. Train multiple sklearn models on temperature values
-5. Compare all models and save the best ones to `checkpoints/`
+Run all cells. The notebook trains and saves:
 
-After training completes, you will see:
-- `checkpoints/best_yolo_model.pt` — Best YOLOv11 model (primary)
-- `checkpoints/best_model.pth` — Best CNN model (legacy)
-- `checkpoints/best_sklearn_model.joblib` — Best sklearn model
-- `checkpoints/yolo11_dpn/` — Full YOLOv11 training run (curves, weights, etc.)
-- `checkpoints/training_history.png` — CNN training loss/accuracy curves
-- `checkpoints/model_comparison_results.csv` — Comparison table of all models
+| File | Model | Input |
+|------|-------|-------|
+| `checkpoints/best_yolo_model.pt` | YOLOv11 large | Thermal images |
+| `checkpoints/best_sklearn_model.joblib` | SVM RBF | Temperature CSVs |
+| `checkpoints/best_model.pth` | CNN (legacy) | Thermal images |
 
 ### Step 3: Start the API Server
 
@@ -177,12 +170,13 @@ The server starts at `http://localhost:8000`. Visit `http://localhost:8000/docs`
 | `/predict/temperature` | POST | JSON body | sklearn |
 | `/predict/batch` | POST | Multiple images | YOLOv11 (or CNN) |
 
-#### Dual-Foot Patient Endpoints (Recommended)
-| Endpoint | Method | Input | Description |
+#### Dual-Foot Patient Endpoints
+| Endpoint | Method | Input | Models used |
 |----------|--------|-------|-------------|
-| `/predict/patient/images` | POST | 2 image files | Both feet thermal images |
-| `/predict/patient/csv` | POST | 2 CSV files | Both feet temperature CSVs |
-| `/predict/patient/temperature` | POST | JSON body | Both feet temperature arrays |
+| `/predict/patient/combined` | POST | 2 images + 2 CSVs | **YOLOv11 + sklearn (fused)** ← recommended |
+| `/predict/patient/images` | POST | 2 image files | YOLOv11 only |
+| `/predict/patient/csv` | POST | 2 CSV files | sklearn only |
+| `/predict/patient/temperature` | POST | JSON body | sklearn only |
 
 ---
 
@@ -221,7 +215,16 @@ curl -X POST "http://localhost:8000/predict/csv" \
   -F "file=@data/Control Group/CG001_M/CG001_M_L.csv"
 ```
 
-**Test dual-foot diagnosis with images:**
+**Test combined dual-foot diagnosis (image + CSV — recommended):**
+```bash
+curl -X POST "http://localhost:8000/predict/patient/combined" \
+  -F "left_foot_image=@data/Control Group/CG001_M/CG001_M_L.png" \
+  -F "right_foot_image=@data/Control Group/CG001_M/CG001_M_R.png" \
+  -F "left_foot_csv=@data/Control Group/CG001_M/CG001_M_L.csv" \
+  -F "right_foot_csv=@data/Control Group/CG001_M/CG001_M_R.csv"
+```
+
+**Test dual-foot diagnosis with images only:**
 ```bash
 curl -X POST "http://localhost:8000/predict/patient/images" \
   -F "left_foot=@data/Control Group/CG001_M/CG001_M_L.png" \
@@ -250,14 +253,19 @@ curl -X POST "http://localhost:8000/predict/patient/temperature" \
 ```python
 import requests
 
-# Test with thermal images (both feet)
-url = "http://localhost:8000/predict/patient/images"
+# Combined diagnosis — image + CSV per foot (recommended)
+url = "http://localhost:8000/predict/patient/combined"
 files = {
-    "left_foot": open("data/Control Group/CG001_M/CG001_M_L.png", "rb"),
-    "right_foot": open("data/Control Group/CG001_M/CG001_M_R.png", "rb"),
+    "left_foot_image":  open("data/Control Group/CG001_M/CG001_M_L.png", "rb"),
+    "right_foot_image": open("data/Control Group/CG001_M/CG001_M_R.png", "rb"),
+    "left_foot_csv":    open("data/Control Group/CG001_M/CG001_M_L.csv", "rb"),
+    "right_foot_csv":   open("data/Control Group/CG001_M/CG001_M_R.csv", "rb"),
 }
 response = requests.post(url, files=files)
-print(response.json())
+result = response.json()
+print(result["combined_prediction"])   # "Diabetic" or "Control"
+print(result["combined_confidence"])   # fused confidence %
+print(result["left_foot"]["fusion_method"])  # shows weights used
 ```
 
 ### Option 5: Test from mobile app / same WiFi
@@ -305,25 +313,33 @@ Returns:
 
 ---
 
-## Example API Response (Dual-Foot Diagnosis)
+## Example API Response (Combined Dual-Foot Diagnosis)
+
+Response from `POST /predict/patient/combined` — each foot result shows the fused probability alongside individual model contributions.
 
 ```json
 {
   "success": true,
   "combined_prediction": "Diabetic",
-  "combined_confidence": 89.5,
+  "combined_confidence": 84.6,
   "is_diabetic": true,
   "left_foot": {
     "prediction": "Diabetic",
-    "confidence": 87.2,
+    "confidence": 83.1,
     "is_diabetic": true,
-    "probabilities": { "Control": 12.8, "Diabetic": 87.2 }
+    "probabilities": { "Control": 16.9, "Diabetic": 83.1 },
+    "yolo_probabilities": { "Control": 12.8, "Diabetic": 87.2 },
+    "sklearn_probabilities": { "Control": 23.0, "Diabetic": 77.0 },
+    "fusion_method": "weighted_average(yolo=60%, sklearn=40%)"
   },
   "right_foot": {
     "prediction": "Diabetic",
-    "confidence": 91.8,
+    "confidence": 86.1,
     "is_diabetic": true,
-    "probabilities": { "Control": 8.2, "Diabetic": 91.8 }
+    "probabilities": { "Control": 13.9, "Diabetic": 86.1 },
+    "yolo_probabilities": { "Control": 8.2, "Diabetic": 91.8 },
+    "sklearn_probabilities": { "Control": 22.5, "Diabetic": 77.5 },
+    "fusion_method": "weighted_average(yolo=60%, sklearn=40%)"
   },
   "asymmetry": {
     "mean_asymmetry": 1.2,

@@ -121,11 +121,15 @@ class DualFootTemperatureInput(BaseModel):
 
 
 class FootResult(BaseModel):
-    """Result for a single foot."""
+    """Result for a single foot. Includes fusion details when both image + CSV were used."""
     prediction: str
     confidence: float
     is_diabetic: bool
     probabilities: dict
+    # Present only when YOLOv11 + sklearn fusion was applied
+    yolo_probabilities: Optional[dict] = None
+    sklearn_probabilities: Optional[dict] = None
+    fusion_method: Optional[str] = None
 
 
 class AsymmetryResult(BaseModel):
@@ -785,6 +789,120 @@ async def predict_patient_temperature(
             status_code=500,
             detail=f"Prediction failed: {str(e)}"
         )
+
+
+@app.post(
+    "/predict/patient/combined",
+    response_model=PatientPredictionResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid input"},
+        500: {"model": ErrorResponse, "description": "Server error"},
+        503: {"model": ErrorResponse, "description": "Model not loaded"}
+    },
+    tags=["Patient Diagnosis"]
+)
+async def predict_patient_combined(
+    left_foot_image: UploadFile = File(..., description="Left foot thermogram image (PNG/JPG)"),
+    right_foot_image: UploadFile = File(..., description="Right foot thermogram image (PNG/JPG)"),
+    left_foot_csv: UploadFile = File(..., description="Left foot temperature CSV"),
+    right_foot_csv: UploadFile = File(..., description="Right foot temperature CSV"),
+):
+    """
+    Combined DPN diagnosis using BOTH thermogram images (YOLOv11) AND
+    temperature CSV data (sklearn) for each foot.
+
+    Per-foot prediction is a weighted fusion:
+      - YOLOv11 image model: 60% weight (primary — 97.5% accuracy)
+      - sklearn temperature model: 40% weight (secondary — raw temperature signal)
+
+    Upload all four files: two foot images + two temperature CSVs.
+    The response includes per-modality probabilities alongside the fused result.
+    """
+    if image_classifier is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Image model not loaded. Please train and save a YOLOv11 model first."
+        )
+    if sklearn_classifier is None:
+        raise HTTPException(
+            status_code=503,
+            detail="sklearn model not loaded. Please ensure best_sklearn_model.joblib exists in checkpoints/"
+        )
+
+    allowed_image_types = {"image/png", "image/jpeg", "image/jpg"}
+    for file, name in [(left_foot_image, "left_foot_image"), (right_foot_image, "right_foot_image")]:
+        if file.content_type not in allowed_image_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type for {name}: {file.content_type}. Allowed: PNG, JPG, JPEG"
+            )
+    for file, name in [(left_foot_csv, "left_foot_csv"), (right_foot_csv, "right_foot_csv")]:
+        if not file.filename.endswith(".csv"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type for {name}. Please upload a CSV file."
+            )
+
+    try:
+        import tempfile
+
+        # Read images
+        left_img  = Image.open(io.BytesIO(await left_foot_image.read())).convert("RGB")
+        right_img = Image.open(io.BytesIO(await right_foot_image.read())).convert("RGB")
+
+        # Read CSVs → numpy + temp files on disk for sklearn classifier
+        left_csv_bytes  = await left_foot_csv.read()
+        right_csv_bytes = await right_foot_csv.read()
+
+        left_temps  = pd.read_csv(io.StringIO(left_csv_bytes.decode("utf-8")),  header=None).values.astype(np.float32)
+        right_temps = pd.read_csv(io.StringIO(right_csv_bytes.decode("utf-8")), header=None).values.astype(np.float32)
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+            pd.DataFrame(left_temps).to_csv(f.name, header=False, index=False)
+            left_csv_path = f.name
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+            pd.DataFrame(right_temps).to_csv(f.name, header=False, index=False)
+            right_csv_path = f.name
+
+        result = predict_patient(
+            cnn_classifier=image_classifier,
+            sklearn_classifier=sklearn_classifier,
+            left_image=left_img,
+            right_image=right_img,
+            left_csv=left_csv_path,
+            right_csv=right_csv_path,
+            left_temps=left_temps,
+            right_temps=right_temps,
+        )
+
+        Path(left_csv_path).unlink(missing_ok=True)
+        Path(right_csv_path).unlink(missing_ok=True)
+
+        def _foot_result(foot_data):
+            if foot_data is None:
+                return None
+            allowed = {
+                "prediction", "confidence", "is_diabetic", "probabilities",
+                "yolo_probabilities", "sklearn_probabilities", "fusion_method",
+            }
+            return FootResult(**{k: v for k, v in foot_data.items() if k in allowed})
+
+        return PatientPredictionResponse(
+            success=True,
+            combined_prediction=result["combined_prediction"],
+            combined_confidence=result["combined_confidence"],
+            is_diabetic=result["is_diabetic"],
+            left_foot=_foot_result(result["left_foot"]),
+            right_foot=_foot_result(result["right_foot"]),
+            asymmetry=AsymmetryResult(**result["asymmetry"]) if result["asymmetry"] else None,
+            diagnosis_factors=result["diagnosis_factors"],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 
 # ==================== Run Server ====================

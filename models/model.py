@@ -353,9 +353,13 @@ class YOLOv11DPNClassifier:
             fliplr=0.5,       # horizontal flip — left/right foot mirror symmetry
             flipud=0.0,       # no vertical flip — foot orientation matters
             degrees=15,       # rotation ±15° for camera tilt variation
-            translate=0.1,    # translate ±10%
-            scale=0.2,        # scale ±20%
+            translate=0.15,   # translate ±15% — handles off-centre foot placement
+            scale=0.5,        # scale ±50% — key fix for 160×120 vs 168×65 size difference
             shear=5.0,        # shear ±5°
+            # Aspect-ratio robustness — critical when camera resolution differs
+            # from training data. rect=False forces square crops which trains the
+            # model to handle any aspect ratio, not just the training data's 2.6:1.
+            rect=False,
             # Colour / intensity (thermal colourmap variation)
             hsv_h=0.015,
             hsv_s=0.4,
