@@ -246,6 +246,34 @@ class DPNClassifier:
         return result
 
 
+def compute_angiosome_means(temps: np.ndarray) -> Dict[str, float]:
+    """Mean temperature of each plantar angiosome region for one foot.
+
+    Uses the same 60% / 35% boundaries as the sklearn feature extractor
+    (Hernandez-Contreras 2019). Background pixels (value 0) are excluded
+    so the mean reflects only foot tissue. Returns 0.0 for an empty region.
+    """
+    if temps is None or temps.size == 0:
+        return {"MPA": 0.0, "LPA": 0.0, "MCA": 0.0, "LCA": 0.0}
+
+    h, w = temps.shape
+    ff_row  = int(0.60 * h)
+    med_col = int(0.35 * w)
+
+    regions = {
+        "MPA": temps[:ff_row, :med_col],
+        "LPA": temps[:ff_row, med_col:],
+        "MCA": temps[ff_row:, :med_col],
+        "LCA": temps[ff_row:, med_col:],
+    }
+
+    means = {}
+    for name, region in regions.items():
+        pixels = region[region > 0]
+        means[name] = round(float(np.mean(pixels)), 2) if pixels.size > 0 else 0.0
+    return means
+
+
 def calculate_asymmetry(
     left_temps: np.ndarray,
     right_temps: np.ndarray
@@ -298,6 +326,16 @@ def calculate_asymmetry(
     ASYMMETRY_THRESHOLD = 2.2
     is_significant = mean_temp_diff > ASYMMETRY_THRESHOLD and mean_asymmetry > 1.0
 
+    # Per-angiosome asymmetry (left foot vs medially-aligned right foot).
+    # Using right_flipped means MPA-vs-MPA, LPA-vs-LPA, etc. line up on the
+    # same anatomical side (medial/lateral) rather than the same screen side.
+    left_regions  = compute_angiosome_means(left_temps)
+    right_regions = compute_angiosome_means(right_flipped)
+    region_asymmetry = {
+        name: round(abs(left_regions[name] - right_regions[name]), 3)
+        for name in ("MPA", "LPA", "MCA", "LCA")
+    }
+
     return {
         "mean_asymmetry": round(mean_asymmetry, 3),
         "max_asymmetry": round(max_asymmetry, 3),
@@ -306,7 +344,8 @@ def calculate_asymmetry(
         "right_foot_mean_temp": round(right_mean, 2),
         "mean_temp_difference": round(mean_temp_diff, 3),
         "asymmetry_significant": is_significant,
-        "threshold_used": ASYMMETRY_THRESHOLD
+        "threshold_used": ASYMMETRY_THRESHOLD,
+        "region_asymmetry": region_asymmetry,
     }
 
 
@@ -466,6 +505,13 @@ def predict_patient(
 
     results["left_foot"]  = _predict_foot(left_image,  left_csv,  left_temps)
     results["right_foot"] = _predict_foot(right_image, right_csv, right_temps)
+
+    # Attach per-region mean temps to each foot result when temps are available.
+    # These are computed directly from the CSV — no model inference involved.
+    if left_temps is not None and results["left_foot"] is not None:
+        results["left_foot"]["regions"] = compute_angiosome_means(left_temps)
+    if right_temps is not None and results["right_foot"] is not None:
+        results["right_foot"]["regions"] = compute_angiosome_means(right_temps)
 
     # Calculate asymmetry when temperature matrices are available for both feet
     if left_temps is not None and right_temps is not None:

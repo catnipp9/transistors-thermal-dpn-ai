@@ -132,6 +132,9 @@ class FootResult(BaseModel):
     yolo_probabilities: Optional[dict] = None
     sklearn_probabilities: Optional[dict] = None
     fusion_method: Optional[str] = None
+    # Per-angiosome mean temperatures (degrees C) — populated when CSV temps are
+    # available. Keys: MPA, LPA, MCA, LCA (Hernandez-Contreras 2019 boundaries).
+    regions: Optional[dict] = None
 
 
 class AsymmetryResult(BaseModel):
@@ -143,6 +146,9 @@ class AsymmetryResult(BaseModel):
     mean_temp_difference: float
     asymmetry_significant: bool
     threshold_used: float
+    # Per-angiosome absolute temperature difference (degrees C) between left
+    # foot and the medially-aligned right foot. Keys: MPA, LPA, MCA, LCA.
+    region_asymmetry: Optional[dict] = None
 
 
 class PatientPredictionResponse(BaseModel):
@@ -905,6 +911,7 @@ async def predict_patient_combined(
             allowed = {
                 "prediction", "confidence", "is_diabetic", "probabilities",
                 "yolo_probabilities", "sklearn_probabilities", "fusion_method",
+                "regions",
             }
             return FootResult(**{k: v for k, v in foot_data.items() if k in allowed})
 
@@ -1040,6 +1047,7 @@ async def predict_patient_mobile(data: MobilePatientInput):
             allowed = {
                 "prediction", "confidence", "is_diabetic", "probabilities",
                 "yolo_probabilities", "sklearn_probabilities", "fusion_method",
+                "regions",
             }
             return FootResult(**{k: v for k, v in foot_data.items() if k in allowed})
 
