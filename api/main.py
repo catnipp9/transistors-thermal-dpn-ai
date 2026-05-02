@@ -73,7 +73,7 @@ class PredictionResponse(BaseModel):
         json_schema_extra = {
             "example": {
                 "success": True,
-                "prediction": "Diabetic",
+                "prediction": "DPN Positive",
                 "class_index": 1,
                 "confidence": 87.5,
                 "is_diabetic": True,
@@ -160,17 +160,17 @@ class PatientPredictionResponse(BaseModel):
         json_schema_extra = {
             "example": {
                 "success": True,
-                "combined_prediction": "Diabetic",
+                "combined_prediction": "DPN Positive",
                 "combined_confidence": 89.5,
                 "is_diabetic": True,
                 "left_foot": {
-                    "prediction": "Diabetic",
+                    "prediction": "DPN Positive",
                     "confidence": 87.2,
                     "is_diabetic": True,
                     "probabilities": {"Control": 12.8, "Diabetic": 87.2}
                 },
                 "right_foot": {
-                    "prediction": "Diabetic",
+                    "prediction": "DPN Positive",
                     "confidence": 91.8,
                     "is_diabetic": True,
                     "probabilities": {"Control": 8.2, "Diabetic": 91.8}

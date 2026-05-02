@@ -201,7 +201,7 @@ class DPNClassifier:
             confidence = probabilities[0, predicted_class].item()
 
         # Map class index to label
-        class_labels = {0: "Control", 1: "Diabetic"}
+        class_labels = {0: "DPN Negative", 1: "DPN Positive"}
 
         result = {
             "prediction": class_labels[predicted_class],
@@ -227,7 +227,7 @@ class DPNClassifier:
         predicted_class = self.model.predict(features)[0]
 
         # Map class index to label
-        class_labels = {0: "Control", 1: "Diabetic"}
+        class_labels = {0: "DPN Negative", 1: "DPN Positive"}
 
         result = {
             "prediction": class_labels[predicted_class],
@@ -365,7 +365,7 @@ def fuse_foot_predictions(
         )
 
     return {
-        "prediction":            "Diabetic" if is_diabetic else "Control",
+        "prediction":            "DPN Positive" if is_diabetic else "DPN Negative",
         "class_index":           1 if is_diabetic else 0,
         "confidence":            max(fused_diabetic, fused_control),
         "is_diabetic":           is_diabetic,
@@ -501,7 +501,7 @@ def predict_patient(
     if left_diabetic is not None and right_diabetic is not None:
         # Both feet analyzed — require BOTH to be diabetic for a positive result
         if left_diabetic and right_diabetic:
-            results["combined_prediction"] = "Diabetic"
+            results["combined_prediction"] = "DPN Positive"
             results["combined_confidence"] = round((left_prob + right_prob) / 2, 2)
             results["diagnosis_factors"].append("Both feet show diabetic indicators")
         elif left_diabetic or right_diabetic:
@@ -509,24 +509,24 @@ def predict_patient(
             avg_prob = (left_prob + right_prob) / 2
             affected = "left" if left_diabetic else "right"
             affected_prob = left_prob if left_diabetic else right_prob
-            # If average diabetic probability across both feet >= 40%, treat as Diabetic
+            # If average diabetic probability across both feet >= 40%, treat as DPN Positive
             # This catches cases like 48% + 33% = 40.5% avg which is clinically concerning
             if avg_prob >= 40.0:
-                results["combined_prediction"] = "Diabetic"
+                results["combined_prediction"] = "DPN Positive"
                 results["combined_confidence"] = round(avg_prob, 2)
                 results["diagnosis_factors"].append(
                     f"Combined diabetic probability ({avg_prob:.1f}%) indicates diabetic signs "
                     f"— left: {left_prob:.1f}%, right: {right_prob:.1f}%"
                 )
             else:
-                results["combined_prediction"] = "Control"
+                results["combined_prediction"] = "DPN Negative"
                 results["combined_confidence"] = round(100.0 - avg_prob, 2)
                 results["diagnosis_factors"].append(
                     f"The {affected} foot shows some diabetic indicators "
                     f"({affected_prob:.1f}% probability) — further evaluation recommended"
                 )
         else:
-            results["combined_prediction"] = "Control"
+            results["combined_prediction"] = "DPN Negative"
             results["combined_confidence"] = round(100.0 - (left_prob + right_prob) / 2, 2)
             results["diagnosis_factors"].append("Neither foot shows diabetic indicators")
 
@@ -544,11 +544,11 @@ def predict_patient(
                 f"({temp_diff:.2f}\u00b0C difference, threshold {threshold}\u00b0C)"
             )
             high_prob_foot = max(left_prob, right_prob)
-            if results["combined_prediction"] == "Control" and high_prob_foot > 60.0:
-                results["combined_prediction"] = "Diabetic"
+            if results["combined_prediction"] == "DPN Negative" and high_prob_foot > 60.0:
+                results["combined_prediction"] = "DPN Positive"
                 results["combined_confidence"] = round(high_prob_foot, 2)
                 results["diagnosis_factors"].append(
-                    "Upgraded to Diabetic: significant asymmetry combined with "
+                    "Upgraded to DPN Positive: significant asymmetry combined with "
                     f"elevated diabetic probability ({high_prob_foot:.1f}%) on one foot"
                 )
 
@@ -561,7 +561,7 @@ def predict_patient(
         results["combined_confidence"] = round(right_prob, 2)
         results["diagnosis_factors"].append("Only right foot analyzed")
 
-    results["is_diabetic"] = results["combined_prediction"] == "Diabetic"
+    results["is_diabetic"] = results["combined_prediction"] == "DPN Positive"
 
     return results
 
