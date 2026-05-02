@@ -9,8 +9,9 @@ AI-powered Diabetic Peripheral Neuropathy (DPN) detection from plantar thermogra
 This system classifies whether a patient has **Diabetic Peripheral Neuropathy (DPN)** by analyzing thermal images and/or temperature readings of the soles of their feet (plantar thermograms).
 
 It takes input from **both feet** and provides:
-- Individual classification per foot (Control vs Diabetic)
-- Temperature asymmetry analysis between left and right feet
+- Individual classification per foot (**DPN Positive** vs **DPN Negative**)
+- Per-foot mean temperatures of the four plantar angiosome regions (MPA, LPA, MCA, LCA)
+- Temperature asymmetry analysis between left and right feet — overall and per-region
 - A combined diagnosis with confidence scores
 
 A temperature difference greater than **2.2 degrees Celsius** between feet is flagged as clinically significant, as asymmetry is a known indicator of nerve damage in DPN.
@@ -40,7 +41,7 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
 - **Trained on**: Google Colab T4 GPU, 100 epochs, batch=32, imgsz=224
 - **Why**: Higher accuracy than the custom CNN due to pre-trained ImageNet weights, advanced augmentation pipeline, and cosine LR scheduling. Oversampling applied to fix class imbalance (45 Control vs 122 Diabetic).
 - **Input**: RGB thermal images (PNG/JPG) — auto-resized to 224×224
-- **Output**: Binary classification (Control vs Diabetic) with confidence percentage
+- **Output**: Binary classification (**DPN Positive** vs **DPN Negative**) with confidence percentage
 - **Saved checkpoint**: `checkpoints/best_yolo_model.pt` (git-ignored, stored separately)
 
 **Available size variants** (tradeoff: speed vs accuracy):
@@ -60,7 +61,7 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
   - Adaptive average pooling for flexible input sizes
   - Fully connected classifier with dropout regularization
 - **Input**: RGB thermal images (PNG/JPG)
-- **Output**: Binary classification (Control vs Diabetic) with confidence percentage
+- **Output**: Binary classification (**DPN Positive** vs **DPN Negative**) with confidence percentage
 - **Saved checkpoint**: `checkpoints/best_model.pth`
 
 ### 3. Classical Machine Learning Models (For Temperature CSV Values)
@@ -72,7 +73,7 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
   - Multi-Layer Perceptron (MLP)
   - Logistic Regression
 - **Input**: CSV temperature matrices (168×65) — 54 angiosome-aligned features extracted (MPA/LPA/MCA/LCA regions per Hernandez-Contreras 2019)
-- **Output**: Binary classification (Control vs Diabetic) with confidence percentage
+- **Output**: Binary classification (**DPN Positive** vs **DPN Negative**) with confidence percentage
 - **Saved checkpoint**: `checkpoints/best_sklearn_model.joblib`
 
 ### 4. Dual-Modality Fusion (New)
@@ -84,24 +85,36 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
 - Per-foot response includes `yolo_probabilities`, `sklearn_probabilities`, and `fusion_method` for transparency
 
 ### 5. Dual-Foot Diagnosis Logic
-- **Both feet must independently predict Diabetic** for a Diabetic result
-- A single diabetic foot is flagged as "further evaluation recommended" — not a positive diagnosis
-- Asymmetry only upgrades a Control result when: mean temp diff >2.2°C **and** the higher-probability foot exceeds 60% Diabetic probability
+- **Both feet must independently classify as DPN Positive** for a positive overall result
+- A single DPN Positive foot is flagged as "further evaluation recommended" — not a positive diagnosis on its own
+- Asymmetry only upgrades a DPN Negative result when: mean temp diff >2.2°C **and** the higher-probability foot exceeds 60% diabetic probability
 - This prevents false positives from borderline or naturally asymmetric healthy feet
 
-### 5. Asymmetry Analysis
+### 6. Asymmetry Analysis
 - Compares temperature distributions between left and right feet
 - Flips the right foot horizontally for pixel-level alignment
 - Significance requires **both**: mean inter-foot difference >2.2°C and mean pixel asymmetry >1.0°C
+
+### 7. Per-Region (Angiosome) Analysis
+- Each foot is divided into the four plantar angiosomes from Hernandez-Contreras 2019:
+  - **MPA** — Medial Plantar Artery (forefoot, medial)
+  - **LPA** — Lateral Plantar Artery (forefoot, lateral) ← top discriminator
+  - **MCA** — Medial Calcaneal Artery (hindfoot, medial)
+  - **LCA** — Lateral Calcaneal Artery (hindfoot, lateral) ← second discriminator
+- API returns the **mean temperature** of each region per foot, computed directly from the CSV matrix
+- API also returns the **per-region asymmetry** — absolute °C difference between the left foot and the medially-aligned (horizontally-flipped) right foot, so MPA pairs with MPA, LPA with LPA, etc.
+- These outputs are computed deterministically from the temperature matrix at inference time — no model retraining is needed if the regions or fields change
 
 ---
 
 ## Dataset
 
-| Group | Subjects | Label |
-|-------|----------|-------|
-| Control Group | 45 | 0 (Healthy) |
-| DM Group | 122 | 1 (Diabetic) |
+| Group | Subjects | Internal class index | API output |
+|-------|----------|----------------------|------------|
+| Control Group | 45 | 0 | DPN Negative |
+| DM Group | 122 | 1 | DPN Positive |
+
+> The internal probability dictionary keys (`Control` / `Diabetic`) are kept unchanged so the fusion math and the sklearn pipeline still work. Only the user-facing `prediction` and `combined_prediction` strings use the new "DPN Positive" / "DPN Negative" wording.
 
 Each subject has:
 - Left foot thermal image (PNG) and temperature matrix (CSV)
@@ -263,9 +276,11 @@ files = {
 }
 response = requests.post(url, files=files)
 result = response.json()
-print(result["combined_prediction"])   # "Diabetic" or "Control"
-print(result["combined_confidence"])   # fused confidence %
-print(result["left_foot"]["fusion_method"])  # shows weights used
+print(result["combined_prediction"])           # "DPN Positive" or "DPN Negative"
+print(result["combined_confidence"])           # fused confidence %
+print(result["left_foot"]["regions"])          # {"MPA": 28.45, "LPA": 29.12, ...}
+print(result["asymmetry"]["region_asymmetry"]) # {"MPA": 0.65, "LPA": 0.83, ...}
+print(result["left_foot"]["fusion_method"])    # shows weights used
 ```
 
 ### Option 5: Test from mobile app / same WiFi
@@ -289,10 +304,12 @@ const response = await fetch('http://192.168.1.5:8000/predict/patient/images', {
     body: formData,
 })
 const result = await response.json()
-// result.is_diabetic      → true/false
-// result.combined_prediction → "Diabetic" or "Control"
-// result.combined_confidence → confidence percentage
-// result.diagnosis_factors   → explanation array
+// result.is_diabetic                    → true/false
+// result.combined_prediction            → "DPN Positive" or "DPN Negative"
+// result.combined_confidence            → confidence percentage
+// result.diagnosis_factors              → explanation array
+// result.left_foot.regions              → { MPA, LPA, MCA, LCA } mean °C per region (when CSV provided)
+// result.asymmetry.region_asymmetry     → { MPA, LPA, MCA, LCA } |left − right| °C per region
 ```
 
 ### Option 6: Check API Health
@@ -320,26 +337,28 @@ Response from `POST /predict/patient/combined` — each foot result shows the fu
 ```json
 {
   "success": true,
-  "combined_prediction": "Diabetic",
+  "combined_prediction": "DPN Positive",
   "combined_confidence": 84.6,
   "is_diabetic": true,
   "left_foot": {
-    "prediction": "Diabetic",
+    "prediction": "DPN Positive",
     "confidence": 83.1,
     "is_diabetic": true,
     "probabilities": { "Control": 16.9, "Diabetic": 83.1 },
     "yolo_probabilities": { "Control": 12.8, "Diabetic": 87.2 },
     "sklearn_probabilities": { "Control": 23.0, "Diabetic": 77.0 },
-    "fusion_method": "weighted_average(yolo=60%, sklearn=40%)"
+    "fusion_method": "weighted_average(yolo=60%, sklearn=40%)",
+    "regions": { "MPA": 28.45, "LPA": 29.12, "MCA": 27.80, "LCA": 28.30 }
   },
   "right_foot": {
-    "prediction": "Diabetic",
+    "prediction": "DPN Positive",
     "confidence": 86.1,
     "is_diabetic": true,
     "probabilities": { "Control": 13.9, "Diabetic": 86.1 },
     "yolo_probabilities": { "Control": 8.2, "Diabetic": 91.8 },
     "sklearn_probabilities": { "Control": 22.5, "Diabetic": 77.5 },
-    "fusion_method": "weighted_average(yolo=60%, sklearn=40%)"
+    "fusion_method": "weighted_average(yolo=60%, sklearn=40%)",
+    "regions": { "MPA": 27.90, "LPA": 28.40, "MCA": 27.20, "LCA": 27.65 }
   },
   "asymmetry": {
     "mean_asymmetry": 1.2,
@@ -348,11 +367,14 @@ Response from `POST /predict/patient/combined` — each foot result shows the fu
     "right_foot_mean_temp": 27.3,
     "mean_temp_difference": 1.2,
     "asymmetry_significant": false,
-    "threshold_used": 2.2
+    "threshold_used": 2.2,
+    "region_asymmetry": { "MPA": 0.55, "LPA": 0.72, "MCA": 0.60, "LCA": 0.65 }
   },
   "diagnosis_factors": ["Both feet show diabetic indicators"]
 }
 ```
+
+> The `regions` field on each foot and the `region_asymmetry` field on the asymmetry block are populated only when CSV temperature matrices are uploaded. For image-only requests (`/predict/patient/images`) those fields are absent.
 
 ---
 
