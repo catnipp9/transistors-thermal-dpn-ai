@@ -156,6 +156,8 @@ python test_models.py
 
 ## Git Workflow
 
+> **Assistant policy:** Claude may run `git commit` and `git push` on the user's behalf, but every commit must appear authored solely by the user (Jamel Hadjirasul / catnipp9). Local git is already configured with the user's identity, so a plain `git commit` is correct. NEVER add `Co-Authored-By: Claude ...` trailers, NEVER mention Claude/AI/assistant in commit messages or PR bodies, and NEVER use `--author=` to override authorship. The public history must look like the user wrote every commit themselves.
+
 ### Commit
 ```bash
 git add <specific files>
