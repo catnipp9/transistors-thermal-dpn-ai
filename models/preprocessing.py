@@ -409,6 +409,121 @@ def extract_foot_roi(
         return PILImage.fromarray(img_np)
 
 
+def validate_thermal_foot(
+    image,
+    temp_matrix: Optional[np.ndarray] = None,
+) -> dict:
+    """
+    Check whether a thermal image contains a valid plantar foot scan.
+
+    Uses two signal sources when both are available:
+      1. Temperature matrix — checks human body temp range and thermal contrast
+      2. Image — checks that a foot-shaped warm region is centred in the frame
+
+    Returns a dict with:
+      is_valid    : bool   — True if image is a valid foot scan
+      reason      : str    — human-readable explanation (shown to user on rejection)
+      confidence  : float  — rough 0-1 confidence that it IS a foot
+    """
+    from PIL import Image as PILImage
+
+    # ── Temperature matrix checks ─────────────────────────────────────────────
+    if temp_matrix is not None:
+        foot_pixels = temp_matrix[temp_matrix > 0]
+        if len(foot_pixels) == 0:
+            return {
+                "is_valid": False,
+                "reason": "No thermal signal detected. Ensure the camera is pointed at the patient's bare foot.",
+                "confidence": 0.0,
+            }
+
+        mean_temp  = float(np.mean(foot_pixels))
+        temp_range = float(np.max(foot_pixels) - np.min(foot_pixels))
+
+        # Human foot is typically 25–38 °C
+        if mean_temp < 20.0 or mean_temp > 42.0:
+            return {
+                "is_valid": False,
+                "reason": (
+                    f"Temperature reading ({mean_temp:.1f}°C average) does not match a "
+                    "human foot. Please point the camera at the patient's bare sole."
+                ),
+                "confidence": 0.0,
+            }
+
+        # Flat thermal signal → not a foot (or camera not functioning)
+        if temp_range < 1.5:
+            return {
+                "is_valid": False,
+                "reason": "Insufficient thermal contrast. Ensure the patient's foot is bare and in frame.",
+                "confidence": 0.1,
+            }
+
+    # ── Image region checks ───────────────────────────────────────────────────
+    if isinstance(image, PILImage.Image):
+        img_np = np.array(image.convert("RGB"), dtype=np.uint8)
+    else:
+        img_np = np.array(image, dtype=np.uint8)
+
+    h, w = img_np.shape[:2]
+    gray = np.mean(img_np, axis=2).astype(np.uint8)
+    threshold = int(np.median(gray[gray > 0]) * 0.75) if np.any(gray > 0) else 30
+    binary = (gray > threshold).astype(np.uint8)
+
+    try:
+        from scipy.ndimage import label as nd_label
+        labeled, num_features = nd_label(binary)
+        if num_features == 0:
+            return {
+                "is_valid": False,
+                "reason": "No clear foot region detected. Please reposition the camera over the sole of the foot.",
+                "confidence": 0.0,
+            }
+
+        component_sizes = np.bincount(labeled.ravel())[1:]
+        largest_label   = int(np.argmax(component_sizes)) + 1
+        component_mask  = (labeled == largest_label)
+        coverage        = component_mask.sum() / (h * w)
+
+        # Foot must cover 20–92 % of the frame
+        if coverage < 0.20:
+            return {
+                "is_valid": False,
+                "reason": "Foot is too far from the camera or too small in frame. Move the camera closer to the sole.",
+                "confidence": round(float(coverage), 2),
+            }
+        if coverage > 0.92:
+            return {
+                "is_valid": False,
+                "reason": "Foot is too close to the camera. Move the camera further away to capture the full sole.",
+                "confidence": round(1.0 - float(coverage), 2),
+            }
+
+        # Aspect ratio — plantar (sole) view is taller than wide
+        rows  = np.any(component_mask, axis=1)
+        cols  = np.any(component_mask, axis=0)
+        roi_h = int(np.where(rows)[0][-1]) - int(np.where(rows)[0][0])
+        roi_w = int(np.where(cols)[0][-1]) - int(np.where(cols)[0][0])
+        if roi_w > 0:
+            aspect = roi_h / roi_w
+            if aspect < 0.5 or aspect > 6.0:
+                return {
+                    "is_valid": False,
+                    "reason": "The detected region does not match the shape of a foot sole. Ensure the camera faces the bottom of the foot directly.",
+                    "confidence": 0.3,
+                }
+
+    except Exception:
+        # If shape analysis fails, be permissive — let DPN model decide
+        return {"is_valid": True, "reason": "Foot validation inconclusive — proceeding.", "confidence": 0.5}
+
+    return {
+        "is_valid": True,
+        "reason": "Valid foot detected.",
+        "confidence": round(min(1.0, float(coverage) * 1.5), 2),
+    }
+
+
 def extract_thermal_features(data: np.ndarray) -> np.ndarray:
     """
     Extract clinically-motivated features from a plantar temperature matrix.

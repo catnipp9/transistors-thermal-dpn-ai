@@ -10,26 +10,29 @@ AI system for detecting **Diabetic Peripheral Neuropathy (DPN)** from plantar th
 
 **Current best models:**
 - `checkpoints/best_yolo_model.pt` — `yolo11l-cls`, Colab T4 GPU, 100 epochs, batch=32. **97.5% top-1 accuracy** on thermal images.
-- `checkpoints/best_sklearn_model.joblib` — SVM RBF pipeline (C=100, gamma=0.01), trained on 54 angiosome-aligned features (MPA/LPA/MCA/LCA per Hernandez-Contreras 2019). **89% test accuracy**. Required for the combined `/predict/patient/combined` endpoint.
+- `checkpoints/best_sklearn_model.joblib` — SVM RBF pipeline (C=100, gamma=0.01), trained on 54 angiosome-aligned features (MPA/LPA/MCA/LCA per Hernandez-Contreras 2019). **89% test accuracy**. Required for the combined endpoints.
+- `checkpoints/best_foot_detector.joblib` — One-Class SVM foot validator, trained on all 261 foot CSVs. Threshold = min training score − 0.05 so no real foot is rejected. Run `python train_foot_detector.py` to retrain.
 
 ---
 
 ## Architecture
 
 ```
-data/                   Raw thermogram data (PNG + CSV per foot per subject)
+data/                     Raw thermogram data (PNG + CSV per foot per subject)
 models/
-  model.py              YOLOv11DPNClassifier, CNN architectures, sklearn factories
-  data_loader.py        ThermogramDataset, prepare_yolo_dataset (with oversampling)
-  trainer.py            YOLOTrainer, CNNTrainer, SklearnTrainer
-  preprocessing.py      Feature extraction, normalization, augmentation
+  model.py                YOLOv11DPNClassifier, CNN architectures, sklearn factories
+  data_loader.py          ThermogramDataset, prepare_yolo_dataset (with oversampling)
+  trainer.py              YOLOTrainer, CNNTrainer, SklearnTrainer
+  preprocessing.py        Feature extraction, normalization, validate_thermal_foot
 api/
-  main.py               FastAPI endpoints (including /predict/patient/combined)
-  inference.py          DPNClassifier, fuse_foot_predictions, predict_patient, calculate_asymmetry
+  main.py                 FastAPI endpoints — foot validation on combined/mobile/images
+  inference.py            DPNClassifier, fuse_foot_predictions, predict_patient, calculate_asymmetry
 notebooks/
-  train_model.ipynb       Local end-to-end training (YOLO + sklearn)
-  train_model_colab.ipynb Colab GPU training (YOLO + sklearn)
-checkpoints/            Saved model weights (git-ignored)
+  train_model.ipynb         Local end-to-end training (YOLO + sklearn)
+  train_model_colab.ipynb   Colab GPU training (YOLO + sklearn)
+train_foot_detector.py    Train One-Class SVM foot validator → checkpoints/best_foot_detector.joblib
+train_fusion.py           Train fusion meta-classifier → checkpoints/best_fusion_model.joblib
+checkpoints/              Saved model weights (git-ignored)
 ```
 
 ---
@@ -111,26 +114,27 @@ Expected output files after training:
 
 ## Mobile App Connection
 
-The mobile app connects to the FastAPI server via HTTP. The recommended endpoint is:
+The mobile app connects to the FastAPI server via HTTP. The recommended endpoint for the FLIR Lepton app is:
 ```
-POST /predict/patient/combined  — accepts left_foot_image + right_foot_image (PNG) + left_foot_csv + right_foot_csv
+POST /predict/patient/mobile  — JSON body: base64 images + 2-D temperature arrays
 ```
-Falls back to images-only if CSV data is unavailable:
+Falls back to multipart upload if needed:
 ```
-POST /predict/patient/images    — accepts left_foot + right_foot PNG files
+POST /predict/patient/combined  — multipart: left_foot_image + right_foot_image (PNG) + left_foot_csv + right_foot_csv
 ```
 
 For local testing (same WiFi):
 ```
-http://<PC_LOCAL_IP>:8000/predict/patient/images
+http://<PC_LOCAL_IP>:8000/predict/patient/mobile
 ```
 
-For production (deployed): a permanent server URL is needed (Railway/Render).
-The API is **not yet deployed** — currently runs locally only.
+For production (deployed): API is deployed to **Hugging Face Spaces** at `https://huggingface.co/spaces/Charlesgaid/dpn-classification-api`.
 
 Key response fields the app should use:
-- `is_diabetic` — boolean, main result
-- `combined_prediction` — "Diabetic" or "Control"
+- `is_valid_foot` — boolean, check this first; false means the input was rejected (not a foot)
+- `rejection_reason` — string explaining why the scan was rejected (only present when `is_valid_foot` is false)
+- `is_diabetic` — boolean, main DPN result
+- `combined_prediction` — "DPN Positive" or "DPN Negative"
 - `combined_confidence` — float, percentage
 - `diagnosis_factors` — array of strings, explanation
 
@@ -208,10 +212,11 @@ These are all covered by `.gitignore`.
 | `Image model not loaded` | No `best_yolo_model.pt` in checkpoints | Run training notebook first |
 | `sklearn model not loaded` | No `best_sklearn_model.joblib` in checkpoints | Run sklearn training cells in Colab or local notebook |
 | 503 on `/predict/patient/combined` | Either model file missing | Both `.pt` and `.joblib` must exist in `checkpoints/` |
+| `is_valid_foot: false` on real foot | Foot detector threshold too tight | Retrain with `python train_foot_detector.py` — threshold is set to min training score |
 | `Classification datasets must be a directory` | Old bug (fixed) | Already handled in `model.py` |
 | `CUDA not available` | No GPU | Normal — training works on CPU, just slower |
-| False positives (Control → Diabetic) | Asymmetry threshold or soft threshold | See `predict_patient` in `inference.py` |
-| False negatives (Diabetic → Control) | Model underfit or class imbalance | Delete `yolo_dataset/`, retrain with oversampling |
+| False positives (DPN Negative → Positive) | Asymmetry threshold or soft threshold | See `predict_patient` in `inference.py` |
+| False negatives (DPN Positive → Negative) | Model underfit or class imbalance | Delete `yolo_dataset/`, retrain with oversampling |
 
 ---
 

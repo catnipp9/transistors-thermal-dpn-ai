@@ -21,6 +21,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.inference import DPNClassifier, get_classifier, predict_patient, calculate_asymmetry
+from models.preprocessing import validate_thermal_foot
 
 
 # ==================== App Configuration ====================
@@ -92,6 +93,7 @@ class HealthResponse(BaseModel):
     image_model_type: str
     sklearn_model_loaded: bool
     fusion_model_loaded: bool
+    foot_detector_loaded: bool
 
 
 class ErrorResponse(BaseModel):
@@ -154,6 +156,8 @@ class AsymmetryResult(BaseModel):
 class PatientPredictionResponse(BaseModel):
     """Response model for dual-foot patient prediction."""
     success: bool
+    is_valid_foot: bool = True
+    rejection_reason: Optional[str] = None
     combined_prediction: str
     combined_confidence: float
     is_diabetic: bool
@@ -200,7 +204,9 @@ class PatientPredictionResponse(BaseModel):
 # image_classifier holds whichever image model is available: YOLOv11 (preferred) or CNN (fallback)
 image_classifier: Optional[DPNClassifier] = None
 sklearn_classifier: Optional[DPNClassifier] = None
-fusion_model = None  # LogisticRegression meta-classifier (checkpoints/best_fusion_model.joblib)
+fusion_model = None       # LogisticRegression meta-classifier
+foot_detector = None      # One-Class SVM foot detector
+foot_detector_threshold = 0.0
 
 # Keep a reference to the legacy name so predict_patient() calls still work
 cnn_classifier: Optional[DPNClassifier] = None
@@ -211,7 +217,7 @@ cnn_classifier: Optional[DPNClassifier] = None
 @app.on_event("startup")
 async def load_models():
     """Load image model (YOLOv11 preferred, CNN fallback), sklearn model, and fusion meta-classifier on startup."""
-    global image_classifier, sklearn_classifier, cnn_classifier, fusion_model
+    global image_classifier, sklearn_classifier, cnn_classifier, fusion_model, foot_detector, foot_detector_threshold
 
     checkpoints_dir = Path(__file__).parent.parent / "checkpoints"
 
@@ -281,6 +287,21 @@ async def load_models():
         print(f"Info: No fusion model at {fusion_path} — using fixed 60/40 weights.")
         print("      Run python train_fusion.py to train it.")
 
+    # --- Foot detector (One-Class SVM) ---
+    foot_detector_path = checkpoints_dir / "best_foot_detector.joblib"
+    if foot_detector_path.exists():
+        try:
+            import joblib as _joblib
+            saved = _joblib.load(foot_detector_path)
+            foot_detector = saved["model"]
+            foot_detector_threshold = saved.get("soft_threshold", 0.0)
+            print(f"Foot detector loaded from {foot_detector_path}")
+        except Exception as e:
+            print(f"Warning: could not load foot detector: {e}")
+    else:
+        print(f"Info: No foot detector at {foot_detector_path}.")
+        print("      Run python train_foot_detector.py to train it.")
+
     if image_classifier is None and sklearn_classifier is None:
         print("WARNING: No models loaded! Run the training notebook first.")
 
@@ -308,6 +329,7 @@ async def health_check():
         image_model_type=model_type,
         sklearn_model_loaded=sklearn_classifier is not None,
         fusion_model_loaded=fusion_model is not None,
+        foot_detector_loaded=foot_detector is not None,
     )
 
 
@@ -604,6 +626,20 @@ async def predict_patient_images(
         left_image = Image.open(io.BytesIO(left_contents)).convert("RGB")
         right_image = Image.open(io.BytesIO(right_contents)).convert("RGB")
 
+        # Stage 1 — image-only heuristic (no CSV in this endpoint, so SVM skipped)
+        for img, side in [(left_image, "Left"), (right_image, "Right")]:
+            check = validate_thermal_foot(img)
+            if not check["is_valid"]:
+                return PatientPredictionResponse(
+                    success=False,
+                    is_valid_foot=False,
+                    rejection_reason=f"{side} foot: {check['reason']}",
+                    combined_prediction="Unknown",
+                    combined_confidence=0.0,
+                    is_diabetic=False,
+                    diagnosis_factors=[f"Scan rejected — {side.lower()} foot image invalid: {check['reason']}"],
+                )
+
         # Get predictions using predict_patient
         result = predict_patient(
             cnn_classifier=image_classifier,
@@ -883,6 +919,52 @@ async def predict_patient_combined(
         left_temps  = pd.read_csv(io.StringIO(left_csv_bytes.decode("utf-8")),  header=None).values.astype(np.float32)
         right_temps = pd.read_csv(io.StringIO(right_csv_bytes.decode("utf-8")), header=None).values.astype(np.float32)
 
+        # ── Two-stage foot validation ─────────────────────────────────────────
+        from models.preprocessing import extract_thermal_features as _etf
+        from scipy.ndimage import zoom as _zoom
+
+        for img, temps, side in [
+            (left_img, left_temps, "Left"),
+            (right_img, right_temps, "Right"),
+        ]:
+            # Stage 1 — heuristic (temp range, coverage, aspect ratio)
+            check = validate_thermal_foot(img, temp_matrix=temps)
+            if not check["is_valid"]:
+                return PatientPredictionResponse(
+                    success=False,
+                    is_valid_foot=False,
+                    rejection_reason=f"{side} foot: {check['reason']}",
+                    combined_prediction="Unknown",
+                    combined_confidence=0.0,
+                    is_diabetic=False,
+                    diagnosis_factors=[f"Scan rejected — {side.lower()} foot image invalid: {check['reason']}"],
+                )
+
+            # Stage 2 — One-Class SVM (learned foot boundary)
+            if foot_detector is not None:
+                try:
+                    t = temps.copy()
+                    if t.shape != (168, 65):
+                        zf = (168 / t.shape[0], 65 / t.shape[1])
+                        t = _zoom(t, zf, order=1)
+                    score = float(foot_detector.decision_function(_etf(t).reshape(1, -1))[0])
+                    if score < foot_detector_threshold:
+                        return PatientPredictionResponse(
+                            success=False,
+                            is_valid_foot=False,
+                            rejection_reason=(
+                                f"{side} foot: The thermal image does not match the expected "
+                                "pattern of a plantar foot scan. Please ensure the camera is "
+                                "facing the sole of the patient's bare foot."
+                            ),
+                            combined_prediction="Unknown",
+                            combined_confidence=0.0,
+                            is_diabetic=False,
+                            diagnosis_factors=[f"Scan rejected — {side.lower()} foot not recognised by foot detector (score: {score:.3f})"],
+                        )
+                except Exception:
+                    pass  # if detector errors, allow through
+
         with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
             pd.DataFrame(left_temps).to_csv(f.name, header=False, index=False)
             left_csv_path = f.name
@@ -1016,6 +1098,56 @@ async def predict_patient_mobile(data: MobilePatientInput):
         for arr, name in [(left_temps, "left"), (right_temps, "right")]:
             if arr.ndim != 2:
                 raise HTTPException(status_code=400, detail=f"{name}_temperatures must be a 2-D array.")
+
+        # ── Foot validation ───────────────────────────────────────────────────
+        # Two-stage check before running DPN analysis:
+        #   Stage 1: Heuristic (temperature range, frame coverage) — fast pre-filter
+        #   Stage 2: One-Class SVM — learned foot feature boundary
+        from models.preprocessing import extract_thermal_features as _etf
+        from scipy.ndimage import zoom as _zoom
+
+        for img, temps, side in [
+            (left_img, left_temps, "Left"),
+            (right_img, right_temps, "Right"),
+        ]:
+            # Stage 1 — heuristic checks
+            check = validate_thermal_foot(img, temp_matrix=temps)
+            if not check["is_valid"]:
+                return PatientPredictionResponse(
+                    success=False,
+                    is_valid_foot=False,
+                    rejection_reason=f"{side} foot: {check['reason']}",
+                    combined_prediction="Unknown",
+                    combined_confidence=0.0,
+                    is_diabetic=False,
+                    diagnosis_factors=[f"Scan rejected — {side.lower()} foot image invalid: {check['reason']}"],
+                )
+
+            # Stage 2 — One-Class SVM (only if model is loaded)
+            if foot_detector is not None:
+                try:
+                    t = temps.copy()
+                    if t.shape != (168, 65):
+                        zf = (168 / t.shape[0], 65 / t.shape[1])
+                        t = _zoom(t, zf, order=1)
+                    features = _etf(t).reshape(1, -1)
+                    score = float(foot_detector.decision_function(features)[0])
+                    if score < foot_detector_threshold:
+                        return PatientPredictionResponse(
+                            success=False,
+                            is_valid_foot=False,
+                            rejection_reason=(
+                                f"{side} foot: The thermal image does not match the expected "
+                                "pattern of a plantar foot scan. Please ensure the camera is "
+                                "facing the sole of the patient's bare foot."
+                            ),
+                            combined_prediction="Unknown",
+                            combined_confidence=0.0,
+                            is_diabetic=False,
+                            diagnosis_factors=[f"Scan rejected — {side.lower()} foot not recognised by foot detector (score: {score:.3f})"],
+                        )
+                except Exception:
+                    pass  # if detector errors, allow through — DPN model acts as final gate
 
         # Write temps to temp CSV files (sklearn classifier reads from file path)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:

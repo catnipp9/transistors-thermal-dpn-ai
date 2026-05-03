@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.model import get_model, YOLOv11DPNClassifier
 from models.data_loader import get_transforms
-from models.preprocessing import extract_thermal_features, extract_foot_roi
+from models.preprocessing import extract_thermal_features, extract_foot_roi, validate_thermal_foot
 
 
 class DPNClassifier:
