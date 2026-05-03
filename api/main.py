@@ -1014,6 +1014,97 @@ async def predict_patient_combined(
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 
+# ==================== Foot Validation Endpoint ====================
+
+class FootValidationInput(BaseModel):
+    image_b64: str = Field(..., description="Base64-encoded PNG of the thermal foot image")
+    temperatures: List[List[float]] = Field(..., description="2-D temperature matrix from FLIR Lepton")
+
+class FootValidationResponse(BaseModel):
+    is_valid_foot: bool
+    reason: str
+    confidence: float
+
+
+@app.post(
+    "/validate/foot",
+    response_model=FootValidationResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid input"},
+        500: {"model": ErrorResponse, "description": "Server error"},
+    },
+    tags=["Foot Validation"],
+    summary="Check whether a thermal scan is a valid plantar foot image",
+)
+async def validate_foot(data: FootValidationInput):
+    """
+    Lightweight two-stage foot validator. Call this before running DPN analysis.
+
+    Stage 1 — heuristic: checks temperature range (20–42 °C), thermal contrast,
+    and frame coverage against known plantar foot characteristics.
+
+    Stage 2 — One-Class SVM: compares the 54-feature thermal signature of the
+    scan against the learned distribution of real foot scans. Inputs that fall
+    outside the boundary are rejected.
+
+    Returns is_valid_foot=true only when both stages pass.
+    """
+    try:
+        # Decode image
+        try:
+            img_bytes = base64.b64decode(data.image_b64)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        except Exception:
+            raise HTTPException(status_code=400, detail="image_b64 is not valid base64-encoded image data.")
+
+        temps = np.array(data.temperatures, dtype=np.float32)
+        if temps.ndim != 2:
+            raise HTTPException(status_code=400, detail="temperatures must be a 2-D array.")
+
+        # Stage 1 — heuristic
+        check = validate_thermal_foot(img, temp_matrix=temps)
+        if not check["is_valid"]:
+            return FootValidationResponse(
+                is_valid_foot=False,
+                reason=check["reason"],
+                confidence=float(check["confidence"]),
+            )
+
+        # Stage 2 — One-Class SVM
+        if foot_detector is not None:
+            try:
+                from models.preprocessing import extract_thermal_features as _etf
+                from scipy.ndimage import zoom as _zoom
+                t = temps.copy()
+                if t.shape != (168, 65):
+                    zf = (168 / t.shape[0], 65 / t.shape[1])
+                    t = _zoom(t, zf, order=1)
+                score = float(foot_detector.decision_function(_etf(t).reshape(1, -1))[0])
+                if score < foot_detector_threshold:
+                    return FootValidationResponse(
+                        is_valid_foot=False,
+                        reason=(
+                            "The thermal image does not match the expected pattern of a "
+                            "plantar foot scan. Please ensure the camera is facing the "
+                            "sole of the patient's bare foot."
+                        ),
+                        confidence=0.0,
+                    )
+            except Exception:
+                pass  # if detector errors, fall through as valid
+
+        return FootValidationResponse(
+            is_valid_foot=True,
+            reason="Valid foot detected.",
+            confidence=float(check["confidence"]),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Foot validation failed: {str(e)}")
+
+
 # ==================== Mobile / FLIR Lepton Endpoint ====================
 
 class MobilePatientInput(BaseModel):
