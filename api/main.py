@@ -21,7 +21,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.inference import DPNClassifier, get_classifier, predict_patient, calculate_asymmetry
-from models.preprocessing import validate_thermal_foot
+
 
 
 # ==================== App Configuration ====================
@@ -626,20 +626,6 @@ async def predict_patient_images(
         left_image = Image.open(io.BytesIO(left_contents)).convert("RGB")
         right_image = Image.open(io.BytesIO(right_contents)).convert("RGB")
 
-        # Stage 1 — image-only heuristic (no CSV in this endpoint, so SVM skipped)
-        for img, side in [(left_image, "Left"), (right_image, "Right")]:
-            check = validate_thermal_foot(img)
-            if not check["is_valid"]:
-                return PatientPredictionResponse(
-                    success=False,
-                    is_valid_foot=False,
-                    rejection_reason=f"{side} foot: {check['reason']}",
-                    combined_prediction="Unknown",
-                    combined_confidence=0.0,
-                    is_diabetic=False,
-                    diagnosis_factors=[f"Scan rejected — {side.lower()} foot image invalid: {check['reason']}"],
-                )
-
         # Get predictions using predict_patient
         result = predict_patient(
             cnn_classifier=image_classifier,
@@ -919,24 +905,6 @@ async def predict_patient_combined(
         left_temps  = pd.read_csv(io.StringIO(left_csv_bytes.decode("utf-8")),  header=None).values.astype(np.float32)
         right_temps = pd.read_csv(io.StringIO(right_csv_bytes.decode("utf-8")), header=None).values.astype(np.float32)
 
-        # ── Foot validation ───────────────────────────────────────────────────
-        for img, temps, side in [
-            (left_img, left_temps, "Left"),
-            (right_img, right_temps, "Right"),
-        ]:
-            # Stage 1 — heuristic (temp range, coverage, aspect ratio)
-            check = validate_thermal_foot(img, temp_matrix=temps)
-            if not check["is_valid"]:
-                return PatientPredictionResponse(
-                    success=False,
-                    is_valid_foot=False,
-                    rejection_reason=f"{side} foot: {check['reason']}",
-                    combined_prediction="Unknown",
-                    combined_confidence=0.0,
-                    is_diabetic=False,
-                    diagnosis_factors=[f"Scan rejected — {side.lower()} foot image invalid: {check['reason']}"],
-                )
-
         with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
             pd.DataFrame(left_temps).to_csv(f.name, header=False, index=False)
             left_csv_path = f.name
@@ -1008,44 +976,17 @@ class FootValidationResponse(BaseModel):
     tags=["Foot Validation"],
     summary="Check whether a thermal scan is a valid plantar foot image",
 )
-async def validate_foot(data: FootValidationInput):
+async def validate_foot(data: FootValidationInput):  # noqa: ARG001
     """
-    Lightweight two-stage foot validator. Call this before running DPN analysis.
-
-    Stage 1 — heuristic: checks temperature range (20–42 °C), thermal contrast,
-    and frame coverage against known plantar foot characteristics.
-
-    Stage 2 — One-Class SVM: compares the 54-feature thermal signature of the
-    scan against the learned distribution of real foot scans. Inputs that fall
-    outside the boundary are rejected.
+    Foot validator endpoint. Validation is currently disabled — always returns valid.
 
     Returns is_valid_foot=true only when both stages pass.
     """
     try:
-        # Decode image
-        try:
-            img_bytes = base64.b64decode(data.image_b64)
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        except Exception:
-            raise HTTPException(status_code=400, detail="image_b64 is not valid base64-encoded image data.")
-
-        temps = np.array(data.temperatures, dtype=np.float32)
-        if temps.ndim != 2:
-            raise HTTPException(status_code=400, detail="temperatures must be a 2-D array.")
-
-        # Stage 1 — heuristic
-        check = validate_thermal_foot(img, temp_matrix=temps)
-        if not check["is_valid"]:
-            return FootValidationResponse(
-                is_valid_foot=False,
-                reason=check["reason"],
-                confidence=float(check["confidence"]),
-            )
-
         return FootValidationResponse(
             is_valid_foot=True,
-            reason="Valid foot detected.",
-            confidence=float(check["confidence"]),
+            reason="Foot validation is currently disabled.",
+            confidence=1.0,
         )
 
     except HTTPException:
@@ -1138,24 +1079,6 @@ async def predict_patient_mobile(data: MobilePatientInput):
         for arr, name in [(left_temps, "left"), (right_temps, "right")]:
             if arr.ndim != 2:
                 raise HTTPException(status_code=400, detail=f"{name}_temperatures must be a 2-D array.")
-
-        # ── Foot validation ───────────────────────────────────────────────────
-        for img, temps, side in [
-            (left_img, left_temps, "Left"),
-            (right_img, right_temps, "Right"),
-        ]:
-            # Stage 1 — heuristic checks
-            check = validate_thermal_foot(img, temp_matrix=temps)
-            if not check["is_valid"]:
-                return PatientPredictionResponse(
-                    success=False,
-                    is_valid_foot=False,
-                    rejection_reason=f"{side} foot: {check['reason']}",
-                    combined_prediction="Unknown",
-                    combined_confidence=0.0,
-                    is_diabetic=False,
-                    diagnosis_factors=[f"Scan rejected — {side.lower()} foot image invalid: {check['reason']}"],
-                )
 
         # Write temps to temp CSV files (sklearn classifier reads from file path)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
