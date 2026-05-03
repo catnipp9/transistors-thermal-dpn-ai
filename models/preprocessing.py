@@ -493,13 +493,8 @@ def validate_thermal_foot(
         component_mask  = (labeled == largest_label)
         coverage        = component_mask.sum() / (h * w)
 
-        # Foot must cover 15–95 % of the foreground area
-        if coverage < 0.15:
-            return {
-                "is_valid": False,
-                "reason": "Foot is too far from the camera or too small in frame. Move the camera closer to the sole.",
-                "confidence": round(float(coverage), 2),
-            }
+        # Foot must not fill more than 95 % of the frame (too close)
+        # No minimum coverage check — pre-isolated scans may have a small foot on a large canvas
         if coverage > 0.95:
             return {
                 "is_valid": False,
