@@ -25,9 +25,8 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
 | **YOLOv11 large** | Thermal image (PNG) | **97.5%** | Primary (60% fusion weight) |
 | SVM RBF | Temperature CSV | **89%** | Secondary (40% fusion weight) |
 | CNN (legacy) | Thermal image (PNG) | 88.68% | Fallback if YOLO unavailable |
-| One-Class SVM | Temperature CSV features | — | Foot validator (pre-screen) |
 
-> The combined `/predict/patient/mobile` endpoint (recommended for FLIR Lepton apps) fuses both models — YOLOv11 reads the image, SVM reads the temperature matrix, and their weighted probabilities determine the final diagnosis. A foot validator runs first to reject non-foot inputs.
+> The combined `/predict/patient/mobile` endpoint (recommended for FLIR Lepton apps) fuses both models — YOLOv11 reads the image, SVM reads the temperature matrix, and their weighted probabilities determine the final diagnosis.
 >
 > Current best image model: `checkpoints/best_yolo_model.pt` — YOLOv11 large, 100 epochs, Colab T4 GPU.
 
@@ -85,26 +84,18 @@ A temperature difference greater than **2.2 degrees Celsius** between feet is fl
 - Falls back gracefully to single-modality when only one input type is available
 - Per-foot response includes `yolo_probabilities`, `sklearn_probabilities`, and `fusion_method` for transparency
 
-### 5. Foot Validator (One-Class SVM)
-- Runs **before** DPN analysis on every request — rejects inputs that are not plantar foot scans
-- Two-stage check:
-  - **Stage 1 — heuristic:** validates temperature range (20–42 °C), thermal contrast (>1.5 °C), and frame coverage (20–92%)
-  - **Stage 2 — One-Class SVM:** trained on all 261 real foot scans; rejects inputs whose 54-feature thermal signature falls outside the learned foot boundary
-- If rejected, the response returns `is_valid_foot: false` with a `rejection_reason` string and no DPN result
-- Trained with: `python train_foot_detector.py` → saves `checkpoints/best_foot_detector.joblib`
-
-### 6. Dual-Foot Diagnosis Logic
+### 5. Dual-Foot Diagnosis Logic
 - **Both feet must independently classify as DPN Positive** for a positive overall result
 - A single DPN Positive foot is flagged as "further evaluation recommended" — not a positive diagnosis on its own
 - Asymmetry only upgrades a DPN Negative result when: mean temp diff >2.2°C **and** the higher-probability foot exceeds 60% diabetic probability
 - This prevents false positives from borderline or naturally asymmetric healthy feet
 
-### 7. Asymmetry Analysis
+### 6. Asymmetry Analysis
 - Compares temperature distributions between left and right feet
 - Flips the right foot horizontally for pixel-level alignment
 - Significance requires **both**: mean inter-foot difference >2.2°C and mean pixel asymmetry >1.0°C
 
-### 8. Per-Region (Angiosome) Analysis
+### 7. Per-Region (Angiosome) Analysis
 - Each foot is divided into the four plantar angiosomes from Hernandez-Contreras 2019:
   - **MPA** — Medial Plantar Artery (forefoot, medial)
   - **LPA** — Lateral Plantar Artery (forefoot, lateral) ← top discriminator
@@ -195,9 +186,9 @@ The server starts at `http://localhost:8000`. Visit `http://localhost:8000/docs`
 #### Dual-Foot Patient Endpoints
 | Endpoint | Method | Input format | Models used |
 |----------|--------|--------------|-------------|
-| `/predict/patient/mobile` | POST | JSON (base64 image + temp array) | **YOLOv11 + sklearn + foot validator** ← recommended for FLIR app |
-| `/predict/patient/combined` | POST | multipart (2 image files + 2 CSV files) | YOLOv11 + sklearn + foot validator |
-| `/predict/patient/images` | POST | multipart (2 image files) | YOLOv11 only + heuristic foot check |
+| `/predict/patient/mobile` | POST | JSON (base64 image + temp array) | **YOLOv11 + sklearn** ← recommended for FLIR app |
+| `/predict/patient/combined` | POST | multipart (2 image files + 2 CSV files) | YOLOv11 + sklearn |
+| `/predict/patient/images` | POST | multipart (2 image files) | YOLOv11 only |
 | `/predict/patient/csv` | POST | multipart (2 CSV files) | sklearn only |
 | `/predict/patient/temperature` | POST | JSON body | sklearn only |
 
@@ -321,8 +312,6 @@ const response = await fetch('http://192.168.1.5:8000/predict/patient/mobile', {
     body: JSON.stringify(body),
 })
 const result = await response.json()
-// result.is_valid_foot                  → false if input is not a foot scan (check this first)
-// result.rejection_reason               → human-readable reason if is_valid_foot is false
 // result.is_diabetic                    → true/false — main DPN result
 // result.combined_prediction            → "DPN Positive" or "DPN Negative"
 // result.combined_confidence            → confidence percentage
@@ -345,7 +334,7 @@ Returns:
   "image_model_type": "YOLO",
   "sklearn_model_loaded": true,
   "fusion_model_loaded": false,
-  "foot_detector_loaded": true
+  "foot_detector_loaded": false
 }
 ```
 
@@ -358,8 +347,6 @@ Response from `POST /predict/patient/mobile` or `POST /predict/patient/combined`
 ```json
 {
   "success": true,
-  "is_valid_foot": true,
-  "rejection_reason": null,
   "combined_prediction": "DPN Positive",
   "combined_confidence": 84.6,
   "is_diabetic": true,
@@ -448,9 +435,7 @@ transistors-thermal-ai-testing/
 │   ├── best_model.pth             # CNN best weights (legacy)
 │   ├── best_sklearn_model.joblib  # Best sklearn model
 │   ├── best_fusion_model.joblib   # Fusion meta-classifier (optional)
-│   ├── best_foot_detector.joblib  # One-Class SVM foot validator
 │   └── yolo11_dpn/                # Full YOLOv11 training run output
-├── train_foot_detector.py         # Train the One-Class SVM foot validator
 ├── train_fusion.py                # Train the fusion meta-classifier
 ├── test_models.py                 # Model validation tests
 ├── requirements.txt               # Python dependencies

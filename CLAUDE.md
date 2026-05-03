@@ -11,7 +11,6 @@ AI system for detecting **Diabetic Peripheral Neuropathy (DPN)** from plantar th
 **Current best models:**
 - `checkpoints/best_yolo_model.pt` — `yolo11l-cls`, Colab T4 GPU, 100 epochs, batch=32. **97.5% top-1 accuracy** on thermal images.
 - `checkpoints/best_sklearn_model.joblib` — SVM RBF pipeline (C=100, gamma=0.01), trained on 54 angiosome-aligned features (MPA/LPA/MCA/LCA per Hernandez-Contreras 2019). **89% test accuracy**. Required for the combined endpoints.
-- `checkpoints/best_foot_detector.joblib` — One-Class SVM foot validator, trained on all 261 foot CSVs. Threshold = min training score − 0.05 so no real foot is rejected. Run `python train_foot_detector.py` to retrain.
 
 ---
 
@@ -25,12 +24,11 @@ models/
   trainer.py              YOLOTrainer, CNNTrainer, SklearnTrainer
   preprocessing.py        Feature extraction, normalization, validate_thermal_foot
 api/
-  main.py                 FastAPI endpoints — foot validation on combined/mobile/images
+  main.py                 FastAPI endpoints
   inference.py            DPNClassifier, fuse_foot_predictions, predict_patient, calculate_asymmetry
 notebooks/
   train_model.ipynb         Local end-to-end training (YOLO + sklearn)
   train_model_colab.ipynb   Colab GPU training (YOLO + sklearn)
-train_foot_detector.py    Train One-Class SVM foot validator → checkpoints/best_foot_detector.joblib
 train_fusion.py           Train fusion meta-classifier → checkpoints/best_fusion_model.joblib
 checkpoints/              Saved model weights (git-ignored)
 ```
@@ -131,8 +129,6 @@ http://<PC_LOCAL_IP>:8000/predict/patient/mobile
 For production (deployed): API is deployed to **Hugging Face Spaces** at `https://huggingface.co/spaces/Charlesgaid/dpn-classification-api`.
 
 Key response fields the app should use:
-- `is_valid_foot` — boolean, check this first; false means the input was rejected (not a foot)
-- `rejection_reason` — string explaining why the scan was rejected (only present when `is_valid_foot` is false)
 - `is_diabetic` — boolean, main DPN result
 - `combined_prediction` — "DPN Positive" or "DPN Negative"
 - `combined_confidence` — float, percentage
@@ -212,7 +208,6 @@ These are all covered by `.gitignore`.
 | `Image model not loaded` | No `best_yolo_model.pt` in checkpoints | Run training notebook first |
 | `sklearn model not loaded` | No `best_sklearn_model.joblib` in checkpoints | Run sklearn training cells in Colab or local notebook |
 | 503 on `/predict/patient/combined` | Either model file missing | Both `.pt` and `.joblib` must exist in `checkpoints/` |
-| `is_valid_foot: false` on real foot | Foot detector threshold too tight | Retrain with `python train_foot_detector.py` — threshold is set to min training score |
 | `Classification datasets must be a directory` | Old bug (fixed) | Already handled in `model.py` |
 | `CUDA not available` | No GPU | Normal — training works on CPU, just slower |
 | False positives (DPN Negative → Positive) | Asymmetry threshold or soft threshold | See `predict_patient` in `inference.py` |
