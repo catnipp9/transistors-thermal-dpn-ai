@@ -466,9 +466,17 @@ def validate_thermal_foot(
         img_np = np.array(image, dtype=np.uint8)
 
     h, w = img_np.shape[:2]
-    gray = np.mean(img_np, axis=2).astype(np.uint8)
-    threshold = int(np.median(gray[gray > 0]) * 0.75) if np.any(gray > 0) else 30
-    binary = (gray > threshold).astype(np.uint8)
+
+    # Detect background color from corners — works whether background is black,
+    # colored, or any other uniform fill used by the app's FLIR renderer.
+    corners = np.array([
+        img_np[0, 0], img_np[0, -1], img_np[-1, 0], img_np[-1, -1],
+    ], dtype=np.float32)
+    bg_color = np.median(corners, axis=0)
+
+    # Pixels whose color differs significantly from the background = foreground (foot)
+    diff = np.max(np.abs(img_np.astype(np.float32) - bg_color), axis=2)
+    binary = (diff > 20).astype(np.uint8)
 
     try:
         from scipy.ndimage import label as nd_label
@@ -485,14 +493,14 @@ def validate_thermal_foot(
         component_mask  = (labeled == largest_label)
         coverage        = component_mask.sum() / (h * w)
 
-        # Foot must cover 20–92 % of the frame
-        if coverage < 0.20:
+        # Foot must cover 15–95 % of the foreground area
+        if coverage < 0.15:
             return {
                 "is_valid": False,
                 "reason": "Foot is too far from the camera or too small in frame. Move the camera closer to the sole.",
                 "confidence": round(float(coverage), 2),
             }
-        if coverage > 0.92:
+        if coverage > 0.95:
             return {
                 "is_valid": False,
                 "reason": "Foot is too close to the camera. Move the camera further away to capture the full sole.",
