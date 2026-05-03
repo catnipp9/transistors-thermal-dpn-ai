@@ -919,10 +919,7 @@ async def predict_patient_combined(
         left_temps  = pd.read_csv(io.StringIO(left_csv_bytes.decode("utf-8")),  header=None).values.astype(np.float32)
         right_temps = pd.read_csv(io.StringIO(right_csv_bytes.decode("utf-8")), header=None).values.astype(np.float32)
 
-        # ── Two-stage foot validation ─────────────────────────────────────────
-        from models.preprocessing import extract_thermal_features as _etf
-        from scipy.ndimage import zoom as _zoom
-
+        # ── Foot validation ───────────────────────────────────────────────────
         for img, temps, side in [
             (left_img, left_temps, "Left"),
             (right_img, right_temps, "Right"),
@@ -939,31 +936,6 @@ async def predict_patient_combined(
                     is_diabetic=False,
                     diagnosis_factors=[f"Scan rejected — {side.lower()} foot image invalid: {check['reason']}"],
                 )
-
-            # Stage 2 — One-Class SVM (learned foot boundary)
-            if foot_detector is not None:
-                try:
-                    t = temps.copy()
-                    if t.shape != (168, 65):
-                        zf = (168 / t.shape[0], 65 / t.shape[1])
-                        t = _zoom(t, zf, order=1)
-                    score = float(foot_detector.decision_function(_etf(t).reshape(1, -1))[0])
-                    if score < foot_detector_threshold:
-                        return PatientPredictionResponse(
-                            success=False,
-                            is_valid_foot=False,
-                            rejection_reason=(
-                                f"{side} foot: The thermal image does not match the expected "
-                                "pattern of a plantar foot scan. Please ensure the camera is "
-                                "facing the sole of the patient's bare foot."
-                            ),
-                            combined_prediction="Unknown",
-                            combined_confidence=0.0,
-                            is_diabetic=False,
-                            diagnosis_factors=[f"Scan rejected — {side.lower()} foot not recognised by foot detector (score: {score:.3f})"],
-                        )
-                except Exception:
-                    pass  # if detector errors, allow through
 
         with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
             pd.DataFrame(left_temps).to_csv(f.name, header=False, index=False)
@@ -1070,29 +1042,6 @@ async def validate_foot(data: FootValidationInput):
                 confidence=float(check["confidence"]),
             )
 
-        # Stage 2 — One-Class SVM
-        if foot_detector is not None:
-            try:
-                from models.preprocessing import extract_thermal_features as _etf
-                from scipy.ndimage import zoom as _zoom
-                t = temps.copy()
-                if t.shape != (168, 65):
-                    zf = (168 / t.shape[0], 65 / t.shape[1])
-                    t = _zoom(t, zf, order=1)
-                score = float(foot_detector.decision_function(_etf(t).reshape(1, -1))[0])
-                if score < foot_detector_threshold:
-                    return FootValidationResponse(
-                        is_valid_foot=False,
-                        reason=(
-                            "The thermal image does not match the expected pattern of a "
-                            "plantar foot scan. Please ensure the camera is facing the "
-                            "sole of the patient's bare foot."
-                        ),
-                        confidence=0.0,
-                    )
-            except Exception:
-                pass  # if detector errors, fall through as valid
-
         return FootValidationResponse(
             is_valid_foot=True,
             reason="Valid foot detected.",
@@ -1191,12 +1140,6 @@ async def predict_patient_mobile(data: MobilePatientInput):
                 raise HTTPException(status_code=400, detail=f"{name}_temperatures must be a 2-D array.")
 
         # ── Foot validation ───────────────────────────────────────────────────
-        # Two-stage check before running DPN analysis:
-        #   Stage 1: Heuristic (temperature range, frame coverage) — fast pre-filter
-        #   Stage 2: One-Class SVM — learned foot feature boundary
-        from models.preprocessing import extract_thermal_features as _etf
-        from scipy.ndimage import zoom as _zoom
-
         for img, temps, side in [
             (left_img, left_temps, "Left"),
             (right_img, right_temps, "Right"),
@@ -1213,32 +1156,6 @@ async def predict_patient_mobile(data: MobilePatientInput):
                     is_diabetic=False,
                     diagnosis_factors=[f"Scan rejected — {side.lower()} foot image invalid: {check['reason']}"],
                 )
-
-            # Stage 2 — One-Class SVM (only if model is loaded)
-            if foot_detector is not None:
-                try:
-                    t = temps.copy()
-                    if t.shape != (168, 65):
-                        zf = (168 / t.shape[0], 65 / t.shape[1])
-                        t = _zoom(t, zf, order=1)
-                    features = _etf(t).reshape(1, -1)
-                    score = float(foot_detector.decision_function(features)[0])
-                    if score < foot_detector_threshold:
-                        return PatientPredictionResponse(
-                            success=False,
-                            is_valid_foot=False,
-                            rejection_reason=(
-                                f"{side} foot: The thermal image does not match the expected "
-                                "pattern of a plantar foot scan. Please ensure the camera is "
-                                "facing the sole of the patient's bare foot."
-                            ),
-                            combined_prediction="Unknown",
-                            combined_confidence=0.0,
-                            is_diabetic=False,
-                            diagnosis_factors=[f"Scan rejected — {side.lower()} foot not recognised by foot detector (score: {score:.3f})"],
-                        )
-                except Exception:
-                    pass  # if detector errors, allow through — DPN model acts as final gate
 
         # Write temps to temp CSV files (sklearn classifier reads from file path)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
