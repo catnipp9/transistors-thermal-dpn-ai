@@ -529,14 +529,13 @@ def predict_patient(
         return foot_result.get("probabilities", {}).get("Diabetic", 0.0)
 
     def _is_diabetic(foot_result):
-        """Flag as diabetic if Diabetic probability >= 45%.
-        Slightly below 50% to catch borderline cases where the model is
-        nearly split — a 48% Diabetic reading is clinically concerning
-        and should not be silently classified as Control."""
+        """Flag as diabetic only if Diabetic probability >= 90%.
+        High threshold to reduce false positives from domain-shifted images
+        (e.g. FLIR Lepton 3.5 vs training camera)."""
         if foot_result is None:
             return None
         diabetic_prob = foot_result.get("probabilities", {}).get("Diabetic", 0.0)
-        return diabetic_prob >= 45.0
+        return diabetic_prob >= 90.0
 
     left_diabetic = _is_diabetic(results["left_foot"])
     right_diabetic = _is_diabetic(results["right_foot"])
@@ -555,9 +554,8 @@ def predict_patient(
             avg_prob = (left_prob + right_prob) / 2
             affected = "left" if left_diabetic else "right"
             affected_prob = left_prob if left_diabetic else right_prob
-            # If average diabetic probability across both feet >= 40%, treat as DPN Positive
-            # This catches cases like 48% + 33% = 40.5% avg which is clinically concerning
-            if avg_prob >= 40.0:
+            # If average diabetic probability across both feet >= 90%, treat as DPN Positive
+            if avg_prob >= 90.0:
                 results["combined_prediction"] = "DPN Positive"
                 results["combined_confidence"] = round(avg_prob, 2)
                 results["diagnosis_factors"].append(
@@ -590,7 +588,7 @@ def predict_patient(
                 f"({temp_diff:.2f}\u00b0C difference, threshold {threshold}\u00b0C)"
             )
             high_prob_foot = max(left_prob, right_prob)
-            if results["combined_prediction"] == "DPN Negative" and high_prob_foot > 60.0:
+            if results["combined_prediction"] == "DPN Negative" and high_prob_foot > 90.0:
                 results["combined_prediction"] = "DPN Positive"
                 results["combined_confidence"] = round(high_prob_foot, 2)
                 results["diagnosis_factors"].append(
